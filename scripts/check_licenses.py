@@ -135,8 +135,12 @@ def expression_is_allowed(node: LicenseNode) -> bool:
 
 
 def load_metadata(root: Path) -> dict:
+    command = ["cargo", "metadata", "--format-version=1"]
+    if (root / "Cargo.lock").exists():
+        command.append("--locked")
+
     result = subprocess.run(
-        ["cargo", "metadata", "--format-version=1", "--locked"],
+        command,
         cwd=root,
         check=False,
         capture_output=True,

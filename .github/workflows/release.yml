@@ -23,6 +23,8 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Determine expected version
         id: expected
         shell: bash
