@@ -71,7 +71,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: PyO3/maturin-action@v1
-        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        if: startsWith(matrix.target, 'x86_64-unknown-linux')
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist
+          sccache: "true"
+
+      - uses: PyO3/maturin-action@v1
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CFLAGS: -std=gnu99
+          CFLAGS_aarch64_unknown_linux_gnu: -std=gnu99
+          "CFLAGS_aarch64-unknown-linux-gnu": -std=gnu99
         with:
           target: ${{ matrix.target }}
           manylinux: auto
