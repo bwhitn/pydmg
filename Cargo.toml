@@ -6,6 +6,9 @@ rust-version = "1.88"
 description = "Cross-platform Python bindings for Apple DMG files"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/bwhitn/pydmg"
+homepage = "https://github.com/bwhitn/pydmg"
+documentation = "https://github.com/bwhitn/pydmg#readme"
 
 [lib]
 name = "pydmg"
