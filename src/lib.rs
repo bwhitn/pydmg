@@ -1428,7 +1428,7 @@ fn list_partitions_json(path: &str) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(signature = (path, partition_index=None, strict=false))]
 fn inspect_gpt_json(path: &str, partition_index: Option<usize>, strict: bool) -> PyResult<String> {
-    let inspection = inspect_gpt_impl(Path::new(path), partition_index).map_err(|error| {
+    let mut inspection = inspect_gpt_impl(Path::new(path), partition_index).map_err(|error| {
         let message = error.to_string();
         if message.contains("out of range") {
             PyIndexError::new_err(message)
@@ -1436,6 +1436,11 @@ fn inspect_gpt_json(path: &str, partition_index: Option<usize>, strict: bool) ->
             PyRuntimeError::new_err(message)
         }
     })?;
+
+    if !strict && !inspection.has_gpt {
+        // Probe mode treats "no GPT found" as an expected negative result.
+        inspection.errors.clear();
+    }
 
     if strict && !inspection.has_gpt {
         let joined = inspection.errors.join(" | ");

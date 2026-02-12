@@ -81,7 +81,7 @@ def test_inspect_gpt_non_strict_reports_absence(tmp_path: Path) -> None:
     assert info["has_gpt"] is False
     assert info["partition_index"] is None
     assert isinstance(info["errors"], list)
-    assert len(info["errors"]) > 0
+    assert info["errors"] == []
 
 
 def test_inspect_gpt_strict_raises(tmp_path: Path) -> None:
