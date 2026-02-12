@@ -14,7 +14,7 @@ Use this checklist for every PyPI release.
 
 ## Per-release steps
 
-1. Choose the release version, for example `0.1.0`.
+1. Choose the release version, for example `0.1.1`.
 2. Ensure versions match in both files:
    - `pyproject.toml`: `project.version`
    - `Cargo.toml`: `package.version`
@@ -22,7 +22,7 @@ Use this checklist for every PyPI release.
 
 ```bash
 . .venv/bin/activate
-python scripts/verify_versions.py --expected 0.1.0
+python scripts/verify_versions.py --expected 0.1.1
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
 pytest -q
@@ -45,15 +45,15 @@ twine check dist/*
 6. Create and push the release tag:
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "Release v0.1.1"
+git push origin v0.1.1
 ```
 
 7. Watch the `Release` workflow in GitHub Actions.
 8. Confirm artifacts appear on PyPI and install test passes:
 
 ```bash
-pip install pydmg==0.1.0
+pip install pydmg==0.1.1
 python -c "import pydmg; print(pydmg.__version__)"
 ```
 
