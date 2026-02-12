@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+*.dll
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+dist/
+build/
+target/
+Cargo.lock
+pydmg.html
+
+# Local disk images should stay untracked by default.
+*.dmg
+# Keep committed test fixtures visible to git.
+!tests/fixtures/*.dmg
