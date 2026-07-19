@@ -44,7 +44,8 @@ decompression, output-safety, CI, release, and fuzz-infrastructure findings have
 The current local suite passes 21 Python integration/adversarial tests and 17 native Rust tests
 (16 cross-platform plus one Unix path-panic regression).
 Ruff, strict mypy, Bandit, rustfmt, and Clippy with warnings denied are green. Python line coverage
-remains 90% and now has a gate; native coverage has a separate 70% workflow gate.
+remains 90% and now has a gate; hosted native coverage is 80.75% lines against a separate 70%
+workflow gate.
 
 The 171 GB BLKX allocation is rejected before entering `apple-dmg`. The malformed APFS case is
 caught at this repository's dependency boundary and returned as `RuntimeError`, but `apfs 0.2.4`
@@ -66,11 +67,11 @@ deployments, but residual third-party resource behavior is deferred in this revi
 | Python tests | 21 passed |
 | Native Rust tests | 17 passed on macOS; 16 cross-platform |
 | Python coverage | 90%; enforced at 90% in CI/release |
-| Native Rust coverage | Prior measured baseline 77.59% lines; enforced at 70% in CI/release |
+| Native Rust coverage | Hosted result 80.75% lines; enforced at 70% in CI/release |
 | Python lint/type | Expanded Ruff rules, strict mypy, and consumer stub check pass |
 | Security lint | Bandit passes; three exact false positives have inline rationale |
 | Rust lint | rustfmt and Clippy `-D warnings` pass |
-| Fuzz harness | Five targets compile; PR smoke and scheduled ASan campaigns are required gates |
+| Fuzz harness | Five targets compile; four hosted PR ASan smoke jobs passed; whole-image fuzz runs on schedule/release |
 | Python dependency audit | No runtime dependencies or known vulnerability in the last completed run |
 | Rust dependency audit | PyO3 and quick-xml advisories resolved; no configured exceptions remain |
 | Documentation | README, API docstrings, security policy, audit, fuzz guide, and `AGENTS.md` updated |
@@ -424,24 +425,27 @@ symlinks, atomic output, and real FAT/HFS+/APFS fixtures. Sensitive crash bytes 
 
 ### QA-007 — Coverage was manual and unenforced
 
-- Status: **Resolved locally; first hosted native report still needs observation**
+- Status: **Resolved and observed in hosted CI**
 
 `pyproject.toml` enforces 90% Python line coverage. CI and release generate separate Python and
-Rust reports and enforce 90% Python / 70% native line floors; CI uploads both. The last local Python
-run was 66/73 statements plus branch accounting (90%). The last completed native instrumented
-baseline before remediation was 77.59% lines, 61.34% functions, and 74.56% regions. The current
-host lacks `cargo-llvm-cov`, so the first post-remediation native result will come from CI.
+Rust reports and enforce 90% Python / 70% native line floors; CI uploads both. The local Python run
+was 66/73 statements plus branch accounting (90%). Hosted run
+[`29674156138`](https://github.com/bwhitn/pydmg/actions/runs/29674156138) at commit `1de7a87`
+confirmed 90% Python coverage and 80.75% native lines, 60.22% functions, and 79.03% regions.
 
 ### QA-008 — Fuzzing was not continuous
 
-- Status: **Resolved locally for infrastructure; hosted campaigns still require observation**
+- Status: **Resolved; hosted PR smoke observed**
 
 Five structure-aware targets, a dictionary, corpus builder, PR smoke matrix, weekly five-minute
 ASan matrix, and release smoke matrix now exist. Direct-parser and whole-image jobs are gates. The
 whole-image harness suppresses only the aborting libFuzzer panic hook so the production
 `catch_unwind` boundary can run; an uncontained Rust panic still reaches libFuzzer's outer catch
 and fails the job. Raw failure artifacts and crash-input log output are withheld from public CI per
-SEC-011.
+SEC-011. Hosted run
+[`29674156143`](https://github.com/bwhitn/pydmg/actions/runs/29674156143) passed the bounded `blkx`,
+`chunk`, `dmg_parse`, and `gpt` ASan jobs; the slower whole-image job was skipped on the PR as
+designed and remains a scheduled and release gate.
 
 ### QA-009 — API and safety documentation was incomplete
 
@@ -499,6 +503,16 @@ Cargo's default package file set omitted the nested `fuzz/` crate even though th
 `FUZZING.md`. Maturin now explicitly includes the fuzz manifest, five targets, and dictionary in
 the sdist. The fuzz lockfile remains intentionally excluded; Cargo resolves that unpublished
 harness independently.
+
+### QA-016 — Hosted native coverage lacked a Python virtual environment
+
+- Status: **Resolved and verified in hosted CI**
+
+The first hosted coverage attempt passed the Python coverage gate but stopped before native
+instrumentation because `maturin develop` could not find a virtual environment. CI and release
+quality jobs now create `.venv`, install their Python tools through that interpreter, and publish
+its binary directory through `GITHUB_PATH`. The native step also uses the current
+`cargo llvm-cov show-env --sh` interface. The replacement hosted coverage job passed both floors.
 
 ## Fuzzing evidence
 
@@ -574,8 +588,8 @@ memory availability are retained for completeness but deferred under the current
 8. The normal workstation `PATH` has stable Cargo but not `rustup`, nightly, `cargo-fuzz`, or
    `cargo-llvm-cov`. A prior temporary nightly/cargo-fuzz toolchain was recoverable under
    `/private/tmp` and was used for the follow-up ASan and focused boundary runs. Post-remediation
-   native coverage remains unobserved locally because `cargo-llvm-cov` is absent; pinned CI owns
-   that assurance check.
+   native coverage remains unavailable locally because `cargo-llvm-cov` is absent; pinned CI owns
+   that assurance check and has recorded an 80.75% hosted line result.
 9. No upstream issue, pull request, or external message was created as part of this repository-only
    work. Upstream coordination is therefore still outstanding.
 
@@ -625,6 +639,11 @@ The Cargo audit used pinned `cargo-audit 0.22.2`, refreshed the RustSec database
 index, scanned 107 locked dependencies, and returned success with no ignores. The other host
 limitations above are reported rather than bypassed.
 
+The replacement hosted PR run passed the Python/native coverage job, dependency-security job,
+lint/type/documentation job, native and Rust 1.88 jobs, and the Python 3.9–3.13 Linux, macOS, and
+Windows matrix. All four PR fuzz-smoke jobs also passed; whole-image fuzz was skipped by its
+documented PR policy.
+
 ## Deferred and non-blocking follow-up
 
 None of these items is an active security blocker under the assessed threat model:
@@ -635,7 +654,7 @@ None of these items is an active security blocker under the assessed threat mode
    and host memory limit.
 3. Consider reporting the contained `fatfs` cycle and `gpt` assertion defects upstream so the local
    guards can eventually become defense in depth rather than the primary boundary.
-4. Observe the first hosted native coverage and sanitizer reruns, then continue longer,
-   multi-platform campaigns and raise floors as stable coverage grows.
+4. Continue longer scheduled and multi-platform sanitizer campaigns, and raise coverage floors as
+   stable coverage grows.
 5. Add ADC only as an optional compatibility improvement through a reviewed bounded
    implementation or upstream support.

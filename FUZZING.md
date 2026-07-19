@@ -156,5 +156,6 @@ means only that no finding occurred during that campaign; it is not a security g
   `/private/tmp` was recoverable and supplied the exact-input, 68-second follow-up, and focused
   post-boundary ASan runs. The latter completed 70,439 `gpt`, 17,096 `dmg_parse`, and 20 `image`
   executions without a crash, timeout, or sanitizer finding. The whole-image seeds are expensive,
-  so that 35-second image run is only smoke evidence. Native coverage still depends on the pinned
-  CI job because `cargo-llvm-cov` is unavailable.
+  so that 35-second image run is only smoke evidence. The workstation still cannot reproduce native
+  coverage because `cargo-llvm-cov` is unavailable, but the pinned hosted job has passed with
+  80.75% native line coverage.
