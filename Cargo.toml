@@ -12,18 +12,30 @@ documentation = "https://github.com/bwhitn/pydmg#readme"
 
 [lib]
 name = "pydmg"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+fuzzing = []
 
 [dependencies]
 anyhow = "1.0"
+apfs = "0.2.4"
 apple-dmg = "0.5.0"
 base64 = "0.22"
+bzip2 = "0.5"
 crc32fast = "1.5"
-dpp = "0.3.0"
 fatfs = "0.3.6"
 flate2 = "1.1"
 gpt = "4.1.0"
-plist = "1.8"
-pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
+hfsplus = "0.2.4"
+lzfse = "0.2"
+plist = { version = "~1.10.0", features = [
+    "enable_unstable_features_that_may_break_with_minor_version_bumps",
+] }
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py39"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3"
+udif = "0.3.4"

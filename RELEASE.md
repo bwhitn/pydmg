@@ -23,20 +23,38 @@ Use this checklist for every PyPI release.
 ```bash
 . .venv/bin/activate
 python scripts/verify_versions.py --expected 0.1.0
+python scripts/check_audit_exceptions.py
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 pytest -q
 ruff check .
+mypy
+bandit -q -r python scripts
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo check --manifest-path fuzz/Cargo.toml --bins
+cargo audit
+python -m pip_audit .
+python -m pip_audit
+coverage run -m pytest -q
+coverage report --fail-under=90
 ```
+
+Generate Python and native Rust coverage reports, and investigate any regression from the baseline
+in [`AUDIT.md`](AUDIT.md). Run all bounded AddressSanitizer fuzz campaigns in
+[`FUZZING.md`](FUZZING.md); parser or dependency changes require a longer campaign. Do not release
+with an unexplained advisory, sanitizer finding, crash, hang, or uncontrolled allocation.
 
 4. Build and validate distributables:
 
 ```bash
 . .venv/bin/activate
 rm -rf dist
-maturin build --release --out dist
+LZMA_API_STATIC=1 maturin build --release --locked --compatibility pypi --auditwheel check --out dist
 maturin sdist --out dist
 twine check dist/*
 ```
@@ -59,7 +77,11 @@ python -c "import pydmg; print(pydmg.__version__)"
 
 ## Notes
 
-- The release workflow enforces version consistency and tag matching.
+- The release workflow enforces version consistency, lint, strict typing, tests, advisory and
+  license policy, Python/native coverage floors, documentation, and direct-parser fuzz smoke before
+  it builds or publishes artifacts.
 - `sdist` is included as the architecture-independent source distribution.
 - You can run `workflow_dispatch` manually and provide `release_version` for preflight checks.
 - License policy is validated via `scripts/check_licenses.py`.
+- Rust advisory exceptions are exact and expire; validate
+  `security/audit-exceptions.json` rather than extending an exception silently.

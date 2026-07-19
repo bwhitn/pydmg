@@ -2,8 +2,15 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master", "main"]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -12,58 +19,185 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.9", "3.11", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.9"
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.9"
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Install dependencies
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install -e ".[test]"
 
-      - name: Run tests
-        run: pytest
+      - name: Run Python integration tests
+        run: python -m pytest
 
   lint:
-    name: Lint
+    name: Lint, Type, And Documentation
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
-      - name: Install lint tools
+      - name: Install development tools
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
-          pip install -e ".[test]"
-
-      - name: Dependency license policy
-        run: python scripts/check_licenses.py
+          python -m pip install -e ".[dev]"
 
       - name: Python lint
         run: ruff check .
 
-      - name: Build pydoc
-        run: python scripts/build_pydoc.py --cleanup
+      - name: Strict static typing
+        run: mypy
+
+      - name: Python security lint
+        run: bandit -q -r python scripts
 
       - name: Rust format check
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
       - name: Rust lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
+
+      - name: Documentation build
+        run: |
+          python scripts/build_pydoc.py --cleanup
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+
+      - name: Dependency license policy
+        run: python scripts/check_licenses.py
+
+      - name: Audit exception policy
+        run: python scripts/check_audit_exceptions.py
+
+      - name: Version consistency
+        run: python scripts/verify_versions.py
+
+  native-test:
+    name: Native Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: "1.88.0"
+      - run: cargo check --locked --all-features
+      - run: cargo test --locked --all-targets --all-features
+
+  security:
+    name: Dependency Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Rust advisory audit
+        run: cargo audit
+
+      - name: Python advisory audit
+        run: |
+          python -m pip_audit .
+          python -m pip_audit
+
+      - name: Validate expiring exceptions
+        run: python scripts/check_audit_exceptions.py
+
+  coverage:
+    name: Python And Native Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install coverage tools
+        run: |
+          cargo install cargo-llvm-cov --version 0.8.6 --locked
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Python coverage gate
+        run: |
+          coverage run -m pytest -q
+          coverage report --fail-under=90
+          coverage xml -o coverage-python.xml
+
+      - name: Native coverage gate
+        shell: bash
+        run: |
+          cargo llvm-cov clean --workspace
+          eval "$(cargo llvm-cov show-env --export-prefix)"
+          maturin develop --features python,pyo3/extension-module
+          cargo test --locked --all-targets --all-features
+          pytest -q
+          cargo llvm-cov report --fail-under-lines 70
+          cargo llvm-cov report --lcov --output-path coverage-rust.lcov
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage-python.xml
+            coverage-rust.lcov

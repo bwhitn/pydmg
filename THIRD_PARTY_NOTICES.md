@@ -7,11 +7,11 @@ remains MIT-licensed, and these components are used under their own licenses.
 
 ## Direct Rust Dependencies Used By `pydmg`
 
-- `apple-dmg` (`0.5.0`): `Apache-2.0 OR MIT`
-- `dpp` (`0.3.0`): `MIT`
-- `fatfs` (`0.3.6`): `MIT`
-- `gpt` (`4.1.0`): `MIT`
-- `pyo3` (`0.22.x`): `MIT OR Apache-2.0`
+- `anyhow`, `base64`, `bzip2`, `crc32fast`, `flate2`, `pyo3 0.29`, `serde`,
+  `serde_json`, and `tempfile`: `MIT OR Apache-2.0`
+- `apple-dmg 0.5.0`: `Apache-2.0 OR MIT`
+- `apfs 0.2.4`, `fatfs 0.3.6`, `gpt 4.1`, `hfsplus 0.2.4`, `lzfse 0.2`, `plist
+  1.x`, and `udif 0.3.4`: `MIT`
 
 Other direct/transitive Rust dependencies and SPDX expressions are recorded in
 `Cargo.lock`.

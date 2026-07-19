@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.9/3.10 compatibility
+    import tomli as tomllib
 
 
 def read_pyproject_version(path: Path) -> str:

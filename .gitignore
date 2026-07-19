@@ -24,8 +24,10 @@ pip-wheel-metadata/
 dist/
 build/
 target/
-Cargo.lock
+/fuzz/Cargo.lock
 pydmg.html
+fuzz/artifacts/
+fuzz/corpus/
 
 # Local disk images should stay untracked by default.
 *.dmg

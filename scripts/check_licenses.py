@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
-
 
 ALLOWED_LICENSE_IDS = {
     "MIT",
@@ -40,9 +38,9 @@ TOKEN_RE = re.compile(r"\(|\)|AND|OR|WITH|[A-Za-z0-9.+-]+")
 @dataclass
 class LicenseNode:
     kind: str
-    value: Optional[str] = None
-    left: Optional["LicenseNode"] = None
-    right: Optional["LicenseNode"] = None
+    value: str | None = None
+    left: LicenseNode | None = None
+    right: LicenseNode | None = None
 
 
 def normalize_expression(expr: str) -> str:
@@ -52,12 +50,12 @@ def normalize_expression(expr: str) -> str:
     return normalized
 
 
-def tokenize(expr: str) -> List[str]:
+def tokenize(expr: str) -> list[str]:
     return TOKEN_RE.findall(expr)
 
 
 class Parser:
-    def __init__(self, tokens: List[str]) -> None:
+    def __init__(self, tokens: list[str]) -> None:
         self.tokens = tokens
         self.index = 0
 
@@ -93,7 +91,8 @@ class Parser:
         token = self.peek()
         if token is None:
             raise ValueError("unexpected end of expression")
-        if token == "(":
+        # This parenthesis is an SPDX grammar token, not a credential.
+        if token == "(":  # nosec B105
             self.index += 1
             node = self.parse_or()
             if self.peek() != ")":
@@ -112,7 +111,7 @@ class Parser:
         self.index += 1
         return token
 
-    def peek(self) -> Optional[str]:
+    def peek(self) -> str | None:
         if self.index >= len(self.tokens):
             return None
         return self.tokens[self.index]
@@ -139,7 +138,8 @@ def load_metadata(root: Path) -> dict:
     if (root / "Cargo.lock").exists():
         command.append("--locked")
 
-    result = subprocess.run(
+    # Fixed Cargo argv with ``shell=False``; no untrusted command input.
+    result = subprocess.run(  # nosec B603
         command,
         cwd=root,
         check=False,
@@ -152,7 +152,7 @@ def load_metadata(root: Path) -> dict:
     return json.loads(result.stdout)
 
 
-def evaluate_license(expr: str) -> Tuple[bool, str]:
+def evaluate_license(expr: str) -> tuple[bool, str]:
     normalized = normalize_expression(expr)
     tokens = tokenize(normalized)
     if not tokens:
@@ -173,7 +173,7 @@ def evaluate_license(expr: str) -> Tuple[bool, str]:
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     metadata = load_metadata(root)
-    failures: List[str] = []
+    failures: list[str] = []
     checked = 0
 
     for pkg in metadata.get("packages", []):

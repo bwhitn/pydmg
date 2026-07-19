@@ -1,0 +1,122 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "fuzz/**"
+      - "scripts/prepare_fuzz_corpus.py"
+      - "src/**"
+      - "tests/fixtures/**"
+  schedule:
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parser-smoke:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: dmg_parse
+            max_len: 4194304
+            timeout: 10
+            rss: 3072
+          - target: blkx
+            max_len: 1048576
+            timeout: 5
+            rss: 2048
+          - target: chunk
+            max_len: 1048576
+            timeout: 5
+            rss: 2048
+          - target: gpt
+            max_len: 4194304
+            timeout: 10
+            rss: 2048
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '300' || '30' }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install fuzz tooling
+        run: |
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          python -m pip install -e ".[test]"
+
+      - name: Prepare structure-aware corpus
+        run: python scripts/prepare_fuzz_corpus.py --output-dir "${{ runner.temp }}/corpus"
+
+      - name: Run bounded AddressSanitizer campaign
+        run: |
+          fuzz_log="${RUNNER_TEMP}/fuzz-${{ matrix.target }}.log"
+          if cargo fuzz run --sanitizer address --build-std "${{ matrix.target }}" \
+              "${{ runner.temp }}/corpus/${{ matrix.target }}" -- \
+              -max_total_time="${FUZZ_SECONDS}" \
+              -max_len="${{ matrix.max_len }}" \
+              -timeout="${{ matrix.timeout }}" \
+              -rss_limit_mb="${{ matrix.rss }}" \
+              -dict=fuzz/dictionaries/dmg.dict \
+              -print_final_stats=1 >"${fuzz_log}" 2>&1; then
+            tail -n 40 "${fuzz_log}"
+          else
+            grep -E '^(SUMMARY:|stat::)' "${fuzz_log}" || true
+            echo "::error::Fuzz target failed; reproduce on a private runner before disclosure."
+            exit 1
+          fi
+
+  image:
+    name: Whole-image fuzz
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install fuzz tooling
+        run: |
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          python -m pip install -e ".[test]"
+
+      - name: Prepare structure-aware corpus
+        run: python scripts/prepare_fuzz_corpus.py --output-dir "${{ runner.temp }}/corpus"
+
+      - name: Run whole-image AddressSanitizer campaign
+        run: |
+          fuzz_log="${RUNNER_TEMP}/fuzz-image.log"
+          if cargo fuzz run --sanitizer address --build-std image \
+              "${{ runner.temp }}/corpus/image" -- \
+              -max_total_time=300 -max_len=4194304 -timeout=30 -rss_limit_mb=4096 \
+              -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1 \
+              >"${fuzz_log}" 2>&1; then
+            tail -n 40 "${fuzz_log}"
+          else
+            grep -E '^(SUMMARY:|stat::)' "${fuzz_log}" || true
+            echo "::error::Whole-image fuzz failed; reproduce on a private runner before disclosure."
+            exit 1
+          fi
