@@ -175,8 +175,10 @@ jobs:
       - name: Install coverage tools
         run: |
           cargo install cargo-llvm-cov --version 0.8.6 --locked
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[dev]"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "${GITHUB_PATH}"
 
       - name: Python coverage gate
         run: |
@@ -188,7 +190,7 @@ jobs:
         shell: bash
         run: |
           cargo llvm-cov clean --workspace
-          eval "$(cargo llvm-cov show-env --export-prefix)"
+          eval "$(cargo llvm-cov show-env --sh)"
           maturin develop --features python,pyo3/extension-module
           cargo test --locked --all-targets --all-features
           pytest -q
