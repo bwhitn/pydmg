@@ -514,6 +514,21 @@ quality jobs now create `.venv`, install their Python tools through that interpr
 its binary directory through `GITHUB_PATH`. The native step also uses the current
 `cargo llvm-cov show-env --sh` interface. The replacement hosted coverage job passed both floors.
 
+### QA-017 — Pinned official actions declared the deprecated Node.js 20 runtime
+
+- Severity: **Low operational compatibility**
+- Status: **Resolved locally and guarded by hosted CI**
+
+The successful post-merge `master` run
+[`29674527731`](https://github.com/bwhitn/pydmg/actions/runs/29674527731) warned that the pinned
+`actions/checkout` and `actions/setup-python` revisions declared Node.js 20, so GitHub forcibly ran
+them on Node.js 24. Direct review of every pinned action descriptor found that the older
+`actions/upload-artifact` and `actions/download-artifact` revisions also declared Node.js 20; the
+remaining third-party actions were already composite or Node.js 24 actions. All workflow
+occurrences now use immutable SHAs for the current official Node.js 24 releases: checkout 7.0.0,
+setup-python 6.3.0, upload-artifact 7.0.1, and download-artifact 8.0.1. This removes reliance on the
+hosted runner's compatibility override without weakening full-SHA pinning.
+
 ## Fuzzing evidence
 
 Initial campaigns used `cargo-fuzz 0.13.2`, nightly Rust, sanitizer-instrumented standard library,
