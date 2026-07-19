@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import lzma
 from pathlib import Path
-from typing import Optional
-
-import pytest
 
 import pydmg
+import pytest
 
 
 def _build_source_tree(tmp_path: Path) -> Path:
@@ -35,7 +33,14 @@ def _build_dmg(tmp_path: Path) -> tuple[Path, Path]:
     return source, dmg
 
 
-def _find_first_regular_file(image_path: Path) -> Optional[str]:
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"symlinks are unavailable in this environment: {error}")
+
+
+def _find_first_regular_file(image_path: Path) -> str | None:
     queue = ["/"]
     visited = set(queue)
     scanned_dirs = 0
@@ -109,6 +114,22 @@ def test_partition_read_and_extract(tmp_path: Path) -> None:
     assert nested_partition_file.read_bytes() == partition_bytes
 
 
+def test_partition_extract_replaces_link_without_following_it(tmp_path: Path) -> None:
+    _, dmg = _build_dmg(tmp_path)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside sentinel")
+    destination = tmp_path / "partition-link.bin"
+    _symlink_or_skip(destination, outside)
+
+    expected = pydmg.read_partition(dmg, 1)
+    written = pydmg.extract_partition(dmg, 1, destination)
+
+    assert written == len(expected)
+    assert not destination.is_symlink()
+    assert destination.read_bytes() == expected
+    assert outside.read_bytes() == b"outside sentinel"
+
+
 def test_fat32_listing_and_extraction(tmp_path: Path) -> None:
     source, dmg = _build_dmg(tmp_path)
 
@@ -131,6 +152,33 @@ def test_fat32_listing_and_extraction(tmp_path: Path) -> None:
 
     extracted_overwrite = pydmg.extract_fat32(dmg, out_dir, partition_index=1, overwrite=True)
     assert f"{root_name}/hello.txt" in extracted_overwrite
+
+
+def test_fat32_extraction_rejects_dangling_file_symlink(tmp_path: Path) -> None:
+    source, dmg = _build_dmg(tmp_path)
+    output_root = tmp_path / "extracted"
+    image_directory = output_root / source.name
+    image_directory.mkdir(parents=True)
+    outside = tmp_path / "escaped.txt"
+    _symlink_or_skip(image_directory / "hello.txt", outside)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        pydmg.extract_fat32(dmg, output_root, partition_index=1)
+
+    assert not outside.exists()
+
+
+def test_fat32_extraction_rejects_symlink_output_root(tmp_path: Path) -> None:
+    _, dmg = _build_dmg(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output_root = tmp_path / "output-link"
+    _symlink_or_skip(output_root, outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        pydmg.extract_fat32(dmg, output_root, partition_index=1)
+
+    assert list(outside.iterdir()) == []
 
 
 def test_index_errors_are_exposed(tmp_path: Path) -> None:
@@ -160,6 +208,24 @@ def test_checksum_helpers_match_inspect(tmp_path: Path) -> None:
     assert valid is True
 
 
+def test_checksum_rejects_data_fork_range_beyond_eof(tmp_path: Path) -> None:
+    _, dmg = _build_dmg(tmp_path)
+    contents = bytearray(dmg.read_bytes())
+    trailer = len(contents) - 512
+    contents[trailer + 24 : trailer + 32] = (len(contents) + 1).to_bytes(8, "big")
+    contents[trailer + 32 : trailer + 40] = (1).to_bytes(8, "big")
+    contents[trailer + 88 : trailer + 92] = bytes(4)
+    malformed = tmp_path / "out-of-range-checksum.dmg"
+    malformed.write_bytes(contents)
+
+    with pytest.raises(RuntimeError, match="data fork range"):
+        pydmg.compute_data_checksum(malformed)
+    with pytest.raises(RuntimeError, match="data fork range"):
+        pydmg.verify_data_checksum(malformed)
+    with pytest.raises(RuntimeError, match="data fork range"):
+        pydmg.inspect(malformed)
+
+
 def test_create_dmg_input_validation(tmp_path: Path) -> None:
     source = _build_source_tree(tmp_path)
     output = tmp_path / "invalid.dmg"
@@ -174,6 +240,23 @@ def test_create_dmg_input_validation(tmp_path: Path) -> None:
     file_source.write_text("x", encoding="utf-8")
     with pytest.raises(ValueError):
         pydmg.create_dmg(file_source, output)
+
+    with pytest.raises(ValueError, match="safety limit"):
+        pydmg.create_dmg(source, output, total_sectors=1_048_577)
+
+
+def test_create_dmg_replaces_link_without_following_it(tmp_path: Path) -> None:
+    source = _build_source_tree(tmp_path)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside sentinel")
+    output = tmp_path / "output-link.dmg"
+    _symlink_or_skip(output, outside)
+
+    pydmg.create_dmg(source, output, total_sectors=32768)
+
+    assert not output.is_symlink()
+    assert pydmg.verify_data_checksum(output) is True
+    assert outside.read_bytes() == b"outside sentinel"
 
 
 def test_inspect_filesystems_reports_fat_metadata(tmp_path: Path) -> None:
@@ -254,6 +337,12 @@ def test_apfs_fixture_listing_and_extract(tmp_path: Path) -> None:
     assert out_file.read_bytes() == payload
 
 
+def test_bzip2_partition_decoder_on_apfs_fixture() -> None:
+    image = Path(__file__).parent / "fixtures" / "apfs-linearmouse-v0.10.2.dmg"
+    primary_gpt_header = pydmg.read_partition(image, 1)
+    assert primary_gpt_header.startswith(b"EFI PART")
+
+
 def test_apple_filesystem_helpers_raise_when_absent(tmp_path: Path) -> None:
     _, dmg = _build_dmg(tmp_path)
 
@@ -263,8 +352,11 @@ def test_apple_filesystem_helpers_raise_when_absent(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError):
         pydmg.read_apple_file(dmg, "/hello.txt")
 
+    output = tmp_path / "hello.txt"
+    output.write_bytes(b"original output")
     with pytest.raises(RuntimeError):
-        pydmg.extract_apple_file(dmg, "/hello.txt", tmp_path / "hello.txt")
+        pydmg.extract_apple_file(dmg, "/hello.txt", output)
+    assert output.read_bytes() == b"original output"
 
 
 def test_dmgimage_convenience_api(tmp_path: Path) -> None:

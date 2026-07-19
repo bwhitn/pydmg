@@ -5,7 +5,7 @@ It uses the Rust crate [`apple-dmg`](https://github.com/indygreg/apple-platform-
 
 - License: MIT
 - Core Rust dependency: `apple-dmg` (`Apache-2.0 OR MIT`, MIT-compatible)
-- HFS+/APFS backend: `dpp` (`MIT`)
+- DMG/HFS+/APFS backends: `udif`, `hfsplus`, and `apfs` (`MIT`)
 - Third-party notices: `THIRD_PARTY_NOTICES.md`
 - Build backend: `maturin` + `pyo3`
 - Platforms: macOS, Linux, Windows
@@ -22,8 +22,8 @@ It uses the Rust crate [`apple-dmg`](https://github.com/indygreg/apple-platform-
 - List partitions and their BLKX chunk tables.
 - Inspect GPT partition-table metadata when GPT is present in DMG partitions.
 - Inspect filesystem metadata for FAT12/16/32 partitions.
-- Auto-detect and inspect HFS+/APFS metadata using `dpp`.
-- Decompress and read partition payload bytes.
+- Auto-detect and inspect HFS+/APFS metadata through a bounded `udif` extraction adapter.
+- Decompress raw, zero-fill, zlib, bzip2, and LZFSE partition chunks with checked limits.
 - Verify data fork CRC32 checksum.
 - List and extract files from FAT32 DMG partitions.
 - List and extract files from auto-detected HFS+/APFS DMG filesystems.
@@ -121,7 +121,10 @@ All paths accept `str` or `pathlib.Path`.
 Common error behavior:
 
 - Raises `RuntimeError` when parsing, decompression, or filesystem reads fail.
-- Raises `ValueError` for invalid user input in some APIs (for example invalid `create_dmg` arguments).
+- Raises `IndexError` when a requested partition index is outside the parsed partition list.
+- Raises `ValueError` for invalid user input (for example invalid `create_dmg` arguments).
+- Catches HFS+/APFS dependency panics and returns `RuntimeError`; Rust's panic hook may still emit a
+  diagnostic to stderr for a malformed image.
 
 ### DMG inspection and metadata
 
@@ -175,10 +178,14 @@ print(len(parts))
 `read_partition(path, index) -> bytes`
 
 - Reads and decompresses the partition payload at `index`.
+- Rejects partitions that expand beyond 512 MiB, compressed chunks larger than 256 MiB, expanded
+  chunks larger than 64 MiB, and non-contiguous BLKX output layouts.
+- ADC-compressed chunks are unsupported by the upstream DMG decoders and raise `RuntimeError`.
 
 `extract_partition(path, index, output_path) -> int`
 
-- Writes that payload to disk and returns bytes written.
+- Atomically replaces `output_path` only after the complete payload is written and synchronized.
+- Replaces a final symlink itself rather than following it to its target.
 
 `compute_data_checksum(path) -> int`
 
@@ -211,6 +218,11 @@ print(pydmg.verify_data_checksum("image.dmg"))
 
 - Extracts files from the selected FAT partition.
 - Returns extracted relative paths.
+- Rejects a symlink output root, symlink path components, and symlink file destinations.
+- Stops after 100,000 entries, nesting deeper than 128, 512 MiB aggregate file data, 576 MiB of
+  dependency reads, or 2,000,000 dependency read operations.
+- This bulk API writes image-derived names. The assessed deployment profile instead writes bytes
+  only to caller-selected files; use this separate API only with a caller-controlled output tree.
 
 Example:
 
@@ -227,14 +239,18 @@ print(files[:3])
 `list_apple_entries(path, directory_path="/") -> list[dict]`
 
 - Auto-detects HFS+ or APFS and lists directory entries.
+- Preflights HFS+ allocation blocks and APFS block/checkpoint metadata before entering the
+  third-party filesystem parsers.
 
 `read_apple_file(path, file_path) -> bytes`
 
 - Reads a single file from detected HFS+/APFS filesystem.
+- Rejects output beyond 512 MiB.
 
 `extract_apple_file(path, file_path, output_path) -> int`
 
-- Writes file content to `output_path` and returns bytes written.
+- Atomically replaces `output_path` after a complete bounded write and returns bytes written.
+- Failure preserves an existing destination.
 
 Example:
 
@@ -255,6 +271,10 @@ print(written)
 
 - Creates a DMG from a directory.
 - `total_sectors` uses 512-byte sectors.
+- The maximum created image is 1,048,576 sectors (512 MiB).
+- Creation uses a sibling temporary file and atomically replaces the final output on success.
+- The assessed threat model assumes the caller-controlled source tree remains immutable while the
+  image is created.
 
 Example:
 
@@ -301,6 +321,34 @@ The test suite covers:
 - HFS+ positive listing/read/extract using upstream `hfsplus-rs` fixture image
 - APFS positive listing/read/extract using non-malware `linearmouse` fixture image
 - partition index error behavior
+- BLKX count/truncation and checked range rejection
+- zlib, bzip2, and LZFSE decoding plus decompression ceilings
+- positive in-memory GPT parsing, GPT assertion/CRC preflight, and pre-allocation plist limits
+- FAT and direct-output symlink defenses and atomic failure behavior
+- FAT/HFS+/APFS dependency read budgets and panic containment
+
+The current suite contains 21 Python tests and 16 cross-platform native Rust tests, plus one Unix
+path-panic regression. CI enforces 90% Python line coverage and 70% native Rust line coverage as
+separate measurements.
+
+## Security, audit, and fuzzing
+
+DMGs and embedded filesystem structures are untrusted binary input. Review the
+[`SECURITY.md`](SECURITY.md) threat model and safe-use guidance before processing images from an
+untrusted source. The dated coverage, dependency, CI, documentation, and security findings are in
+[`AUDIT.md`](AUDIT.md); reproducible coverage-guided fuzzing instructions are in
+[`FUZZING.md`](FUZZING.md).
+
+Repository-owned range, decompression, plist pre-allocation, GPT, FAT-read, checksum,
+output-atomicity, lint, test, and CI findings have local remediations. APFS parser panics and
+APFS/HFS traversal-budget defects are bounded or contained where possible but remain open
+upstream; ADC decoding remains an explicit fail-closed compatibility limitation. The obsolete XAR
+dependency path was removed, so the locked graph uses patched `quick-xml 0.41.0` with no advisory
+exceptions. The active threat model is a static attacker-crafted image, immutable during
+processing, with caller-selected output files and no hostile concurrent filesystem writer. CPU and
+memory exhaustion are deferred in the current assessment. Provenance is not required, and selected
+content is recorded only as inert bytes or text with no active execution. Sandbox and host limits
+remain broader defense in depth. A successful CRC32 check is not authenticity verification.
 
 ## API Docs (`pydoc`)
 
@@ -317,8 +365,12 @@ build succeeds.
 
 This repo includes workflows for:
 
-- CI: build + test on Linux, macOS, and Windows
-- Release: build wheels for major architectures, build source distribution, and publish to PyPI
+- CI: Python 3.9–3.13 and Rust tests, lint, strict typing, Bandit, dependency audits, MSRV, and
+  separate Python/native coverage gates
+- Fuzz: required PR smoke and scheduled AddressSanitizer campaigns; sensitive failures remain on
+  the runner for private reproduction rather than being uploaded from the public repository
+- Release: repeat quality/security/coverage/fuzz gates, build wheels and source distribution, then
+  publish to PyPI through trusted publishing
 
 Release workflow targets:
 
@@ -329,7 +381,7 @@ Release workflow targets:
 
 For publishing, configure PyPI trusted publishing for this repository and push a tag like `v0.1.0`.
 
-Detailed release steps are documented in `RELEASE.md`.
+Detailed release steps are documented in [`RELEASE.md`](RELEASE.md).
 
 ## Licensing Notes
 

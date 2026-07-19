@@ -1,20 +1,23 @@
-#![allow(clippy::useless_conversion)]
+#![cfg_attr(all(feature = "fuzzing", not(feature = "python")), allow(dead_code))]
 
 use std::{
+    any::Any,
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use apple_dmg::{BlkxChunk, BlkxTable, ChunkType, KolyTrailer};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use bzip2::read::BzDecoder;
 use crc32fast::Hasher;
-use dpp::{DmgPipeline, FilesystemHandle};
 use fatfs::{FatType, FileSystem, FsOptions, ReadWriteSeek};
 use flate2::read::ZlibDecoder;
 use gpt::{disk::LogicalBlockSize, GptConfig};
 use plist::{Dictionary, Value};
+#[cfg(feature = "python")]
 use pyo3::{
     exceptions::{PyIndexError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -22,8 +25,172 @@ use pyo3::{
 };
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
+use tempfile::{tempfile, NamedTempFile};
+use udif::{
+    DmgArchive as UdifDmgArchive, DmgReaderOptions as UdifDmgReaderOptions,
+    PartitionType as UdifPartitionType,
+};
 
 const SECTOR_SIZE: u64 = 512;
+const KOLY_TRAILER_SIZE: u64 = 512;
+const BLKX_HEADER_SIZE: usize = 204;
+const BLKX_CHUNK_SIZE: usize = 40;
+const BLKX_CHUNK_COUNT_OFFSET: usize = 200;
+const MAX_PLIST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PLIST_DEPTH: usize = 128;
+const MAX_PLIST_NODES: usize = 1_000_000;
+const MAX_BLKX_CHUNKS: usize = 262_144;
+const MAX_PARTITION_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_COMPRESSED_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EXPANDED_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_APPLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FILESYSTEM_ENTRIES: usize = 100_000;
+const MAX_FILESYSTEM_DEPTH: usize = 128;
+const MAX_METADATA_CANDIDATES: usize = 10_000;
+const MAX_METADATA_VALUE_CHARS: usize = 4_096;
+const MAX_GPT_PARTITIONS: u32 = 16_384;
+const MAX_FILESYSTEM_DEPENDENCY_READ_BYTES: u64 = MAX_PARTITION_BYTES + 64 * 1024 * 1024;
+const MAX_FILESYSTEM_DEPENDENCY_READ_OPERATIONS: u64 = 2_000_000;
+const HFS_VOLUME_HEADER_OFFSET: u64 = 1_024;
+const HFS_VOLUME_HEADER_PREFIX_SIZE: usize = 48;
+const HFS_MIN_ALLOCATION_BLOCK_BYTES: u32 = 512;
+const MAX_HFS_ALLOCATION_BLOCK_BYTES: u32 = 64 * 1024 * 1024;
+const APFS_SUPERBLOCK_PREFIX_SIZE: usize = 48;
+const APFS_MIN_BLOCK_BYTES: u32 = 4_096;
+const APFS_MAX_BLOCK_BYTES: u32 = 65_536;
+const MAX_APFS_CHECKPOINT_BLOCKS: u32 = 4_096;
+
+#[derive(Debug)]
+struct ReadOnlyDevice<'a> {
+    inner: Cursor<&'a [u8]>,
+}
+
+impl<'a> ReadOnlyDevice<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            inner: Cursor::new(bytes),
+        }
+    }
+}
+
+impl Read for ReadOnlyDevice<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl Write for ReadOnlyDevice<'_> {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "read-only parser device",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for ReadOnlyDevice<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[derive(Debug)]
+struct BudgetedIo<T> {
+    inner: T,
+    read_bytes: u64,
+    read_operations: u64,
+    max_read_bytes: u64,
+    max_read_operations: u64,
+}
+
+impl<T> BudgetedIo<T> {
+    fn new(inner: T) -> Self {
+        Self::with_limits(
+            inner,
+            MAX_FILESYSTEM_DEPENDENCY_READ_BYTES,
+            MAX_FILESYSTEM_DEPENDENCY_READ_OPERATIONS,
+        )
+    }
+
+    fn with_limits(inner: T, max_read_bytes: u64, max_read_operations: u64) -> Self {
+        Self {
+            inner,
+            read_bytes: 0,
+            read_operations: 0,
+            max_read_bytes,
+            max_read_operations,
+        }
+    }
+}
+
+impl<T: Read> Read for BudgetedIo<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return self.inner.read(buffer);
+        }
+
+        self.read_operations = self.read_operations.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem dependency read operation count overflow",
+            )
+        })?;
+        if self.read_operations > self.max_read_operations {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem dependency read operation budget exceeded",
+            ));
+        }
+
+        let remaining = self
+            .max_read_bytes
+            .checked_sub(self.read_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesystem dependency read byte count overflow",
+                )
+            })?;
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem dependency read byte budget exceeded",
+            ));
+        }
+
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.read_bytes = self.read_bytes.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem dependency read byte count overflow",
+            )
+        })?;
+        Ok(read)
+    }
+}
+
+impl<T: Write> Write for BudgetedIo<T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: Seek> Seek for BudgetedIo<T> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
 
 #[derive(Debug)]
 struct ParsedDmg {
@@ -199,9 +366,8 @@ struct FilesystemsInspection {
 }
 
 enum AppleFsHandle {
-    Dmg(FilesystemHandle),
-    HfsRaw(dpp::hfsplus::HfsVolume<BufReader<File>>),
-    ApfsRaw(dpp::apfs::ApfsVolume<BufReader<File>>),
+    Hfs(Box<hfsplus::HfsVolume<BudgetedIo<BufReader<File>>>>),
+    Apfs(Box<apfs::ApfsVolume<BudgetedIo<BufReader<File>>>>),
 }
 
 #[derive(Debug, Serialize)]
@@ -266,21 +432,341 @@ fn parse_dmg(path: &Path) -> Result<ParsedDmg> {
         .len();
     let mut reader = BufReader::new(file);
 
-    let koly = KolyTrailer::read_from(&mut reader)
-        .with_context(|| format!("unable to read koly trailer from {}", path.display()))?;
+    parse_dmg_reader(&mut reader, file_size)
+}
 
-    let plist_end = koly
-        .plist_offset
-        .checked_add(koly.plist_length)
-        .ok_or_else(|| anyhow!("plist offset overflow"))?;
-    if plist_end > file_size {
+fn validate_file_range(file_size: u64, offset: u64, length: u64, label: &str) -> Result<()> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| anyhow!("{label} range overflows u64"))?;
+    if offset > file_size || end > file_size {
+        bail!("{label} range {offset}..{end} exceeds file size {file_size}");
+    }
+    Ok(())
+}
+
+fn validate_koly_ranges(koly: &KolyTrailer, file_size: u64) -> Result<()> {
+    if file_size < KOLY_TRAILER_SIZE {
+        bail!("DMG is smaller than the {KOLY_TRAILER_SIZE}-byte koly trailer");
+    }
+
+    validate_file_range(
+        file_size,
+        koly.data_fork_offset,
+        koly.data_fork_length,
+        "data fork",
+    )?;
+    validate_file_range(file_size, koly.plist_offset, koly.plist_length, "plist")?;
+
+    if koly.resource_fork_length != 0 {
+        validate_file_range(
+            file_size,
+            koly.resource_fork_offset,
+            koly.resource_fork_length,
+            "resource fork",
+        )?;
+    }
+    if koly.code_signature_size != 0 {
+        validate_file_range(
+            file_size,
+            koly.code_signature_offset,
+            koly.code_signature_size,
+            "code signature",
+        )?;
+    }
+    if koly.plist_length > MAX_PLIST_BYTES {
         bail!(
-            "plist range {}..{} exceeds file size {}",
-            koly.plist_offset,
-            plist_end,
-            file_size
+            "plist length {} exceeds safety limit {}",
+            koly.plist_length,
+            MAX_PLIST_BYTES
         );
     }
+    Ok(())
+}
+
+fn validate_plist_structure(root: &Value) -> Result<()> {
+    let mut stack = vec![(root, 0_usize)];
+    let mut nodes = 0_usize;
+
+    while let Some((value, depth)) = stack.pop() {
+        nodes = nodes
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("plist node count overflow"))?;
+        if nodes > MAX_PLIST_NODES {
+            bail!("plist exceeds node limit {MAX_PLIST_NODES}");
+        }
+        if depth > MAX_PLIST_DEPTH {
+            bail!("plist exceeds nesting-depth limit {MAX_PLIST_DEPTH}");
+        }
+
+        match value {
+            Value::Array(values) => {
+                for child in values {
+                    stack.push((child, depth + 1));
+                }
+            }
+            Value::Dictionary(dict) => {
+                for child in dict.values() {
+                    stack.push((child, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn read_binary_plist_uint(bytes: &[u8], offset: usize, size: usize, label: &str) -> Result<u64> {
+    if size == 0 || size > 8 {
+        bail!("invalid binary plist {label} integer size {size}");
+    }
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| anyhow!("binary plist {label} range overflow"))?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("binary plist {label} is truncated"))?;
+    Ok(field
+        .iter()
+        .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte)))
+}
+
+fn binary_plist_collection_length(
+    bytes: &[u8],
+    marker_offset: usize,
+    short_length: u8,
+    object_table_end: usize,
+) -> Result<(u64, usize)> {
+    if short_length < 0x0f {
+        return Ok((u64::from(short_length), marker_offset + 1));
+    }
+
+    let length_marker_offset = marker_offset
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("binary plist collection length offset overflow"))?;
+    let length_marker = *bytes
+        .get(length_marker_offset)
+        .ok_or_else(|| anyhow!("binary plist collection length marker is truncated"))?;
+    if length_marker >> 4 != 0x01 || length_marker & 0x0f > 3 {
+        bail!("binary plist collection has an invalid extended length marker");
+    }
+    let length_size = 1_usize << usize::from(length_marker & 0x0f);
+    let length_offset = length_marker_offset
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("binary plist collection length offset overflow"))?;
+    let length = read_binary_plist_uint(bytes, length_offset, length_size, "collection length")?;
+    let references_offset = length_offset
+        .checked_add(length_size)
+        .ok_or_else(|| anyhow!("binary plist collection reference offset overflow"))?;
+    if references_offset > object_table_end {
+        bail!("binary plist collection length extends beyond the object table");
+    }
+    Ok((length, references_offset))
+}
+
+fn preflight_binary_plist(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(b"bplist00") {
+        return Ok(());
+    }
+    if bytes.len() < 40 {
+        bail!("binary plist is too short for its header and trailer");
+    }
+
+    let trailer_offset = bytes.len() - 32;
+    let trailer = &bytes[trailer_offset..];
+    let offset_size = usize::from(trailer[6]);
+    let reference_size = usize::from(trailer[7]);
+    if !matches!(offset_size, 1 | 2 | 3 | 4 | 8) {
+        bail!("invalid binary plist object-offset size {offset_size}");
+    }
+    if !matches!(reference_size, 1 | 2 | 3 | 4 | 8) {
+        bail!("invalid binary plist object-reference size {reference_size}");
+    }
+
+    let object_count = read_binary_plist_uint(trailer, 8, 8, "object count")?;
+    if object_count == 0 {
+        bail!("binary plist declares no objects");
+    }
+    if object_count > MAX_PLIST_NODES as u64 {
+        bail!("binary plist object count {object_count} exceeds node limit {MAX_PLIST_NODES}");
+    }
+    let root_object = read_binary_plist_uint(trailer, 16, 8, "root object")?;
+    if root_object >= object_count {
+        bail!("binary plist root object {root_object} is out of range for {object_count} objects");
+    }
+
+    let offset_table_offset_u64 = read_binary_plist_uint(trailer, 24, 8, "offset-table offset")?;
+    let offset_table_offset = usize::try_from(offset_table_offset_u64)
+        .context("binary plist offset-table offset exceeds usize")?;
+    let object_count_usize =
+        usize::try_from(object_count).context("binary plist object count exceeds usize")?;
+    let offset_table_length = object_count_usize
+        .checked_mul(offset_size)
+        .ok_or_else(|| anyhow!("binary plist offset-table length overflow"))?;
+    let offset_table_end = offset_table_offset
+        .checked_add(offset_table_length)
+        .ok_or_else(|| anyhow!("binary plist offset-table range overflow"))?;
+    if offset_table_offset < 8 || offset_table_end > trailer_offset {
+        bail!("binary plist offset table is outside the object-table region");
+    }
+
+    for index in 0..object_count_usize {
+        let field_offset = offset_table_offset
+            .checked_add(
+                index
+                    .checked_mul(offset_size)
+                    .ok_or_else(|| anyhow!("binary plist object-offset index overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("binary plist object-offset field overflow"))?;
+        let object_offset_u64 =
+            read_binary_plist_uint(bytes, field_offset, offset_size, "object offset")?;
+        let object_offset = usize::try_from(object_offset_u64)
+            .context("binary plist object offset exceeds usize")?;
+        let marker = *bytes
+            .get(object_offset)
+            .filter(|_| object_offset >= 8 && object_offset < offset_table_offset)
+            .ok_or_else(|| anyhow!("binary plist object {index} offset is out of bounds"))?;
+        let object_type = marker >> 4;
+        if !matches!(object_type, 0x0a | 0x0d) {
+            continue;
+        }
+
+        let (collection_length, references_offset) = binary_plist_collection_length(
+            bytes,
+            object_offset,
+            marker & 0x0f,
+            offset_table_offset,
+        )?;
+        if collection_length > MAX_PLIST_NODES as u64 {
+            bail!(
+                "binary plist collection length {collection_length} exceeds node limit {MAX_PLIST_NODES}"
+            );
+        }
+        let reference_count = if object_type == 0x0d {
+            collection_length
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("binary plist dictionary reference count overflow"))?
+        } else {
+            collection_length
+        };
+        let reference_bytes = reference_count
+            .checked_mul(reference_size as u64)
+            .ok_or_else(|| anyhow!("binary plist collection reference length overflow"))?;
+        let references_end = u64::try_from(references_offset)
+            .context("binary plist reference offset exceeds u64")?
+            .checked_add(reference_bytes)
+            .ok_or_else(|| anyhow!("binary plist collection reference range overflow"))?;
+        if references_end > offset_table_offset_u64 {
+            bail!("binary plist collection references extend beyond the object table");
+        }
+    }
+
+    Ok(())
+}
+
+struct BoundedPlistEvents<I> {
+    inner: I,
+    nodes: usize,
+    depth: usize,
+    stopped: bool,
+    limit_error: Option<String>,
+}
+
+impl<I> BoundedPlistEvents<I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            nodes: 0,
+            depth: 0,
+            stopped: false,
+            limit_error: None,
+        }
+    }
+
+    fn stop(&mut self, message: String) {
+        self.stopped = true;
+        self.limit_error = Some(message);
+    }
+}
+
+impl<I> Iterator for BoundedPlistEvents<I>
+where
+    I: Iterator<Item = std::result::Result<plist::stream::OwnedEvent, plist::Error>>,
+{
+    type Item = std::result::Result<plist::stream::OwnedEvent, plist::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stopped {
+            return None;
+        }
+        let event = self.inner.next()?;
+        let Ok(event) = event else {
+            return Some(event);
+        };
+
+        match &event {
+            plist::stream::Event::EndCollection => {
+                self.depth = self.depth.saturating_sub(1);
+                return Some(Ok(event));
+            }
+            plist::stream::Event::StartArray(length)
+            | plist::stream::Event::StartDictionary(length) => {
+                if length.is_some_and(|length| length > MAX_PLIST_NODES as u64) {
+                    self.stop(format!(
+                        "plist collection length exceeds node limit {MAX_PLIST_NODES}"
+                    ));
+                    return None;
+                }
+                if self.depth > MAX_PLIST_DEPTH {
+                    self.stop(format!(
+                        "plist exceeds nesting-depth limit {MAX_PLIST_DEPTH}"
+                    ));
+                    return None;
+                }
+                self.depth = self.depth.saturating_add(1);
+            }
+            _ => {
+                if self.depth > MAX_PLIST_DEPTH {
+                    self.stop(format!(
+                        "plist exceeds nesting-depth limit {MAX_PLIST_DEPTH}"
+                    ));
+                    return None;
+                }
+            }
+        }
+
+        self.nodes = match self.nodes.checked_add(1) {
+            Some(nodes) => nodes,
+            None => {
+                self.stop("plist node count overflow".to_string());
+                return None;
+            }
+        };
+        if self.nodes > MAX_PLIST_NODES {
+            self.stop(format!("plist exceeds node limit {MAX_PLIST_NODES}"));
+            return None;
+        }
+        Some(Ok(event))
+    }
+}
+
+fn parse_plist_payload(bytes: &[u8]) -> Result<Value> {
+    preflight_binary_plist(bytes)?;
+    let reader = plist::stream::Reader::new(Cursor::new(bytes));
+    let mut events = BoundedPlistEvents::new(reader);
+    let parsed = Value::from_events(&mut events);
+    if let Some(error) = events.limit_error {
+        bail!(error);
+    }
+    let plist = parsed.context("unable to parse plist payload")?;
+    validate_plist_structure(&plist)?;
+    Ok(plist)
+}
+
+fn parse_dmg_reader<R: Read + Seek>(reader: &mut R, file_size: u64) -> Result<ParsedDmg> {
+    let koly = KolyTrailer::read_from(reader).context("unable to read koly trailer")?;
+    validate_koly_ranges(&koly, file_size)?;
 
     reader
         .seek(SeekFrom::Start(koly.plist_offset))
@@ -292,9 +778,7 @@ fn parse_dmg(path: &Path) -> Result<ParsedDmg> {
         .read_exact(&mut plist_bytes)
         .context("unable to read plist payload")?;
 
-    let plist = Value::from_reader(Cursor::new(&plist_bytes))
-        .or_else(|_| Value::from_reader_xml(Cursor::new(&plist_bytes)))
-        .context("unable to parse plist payload")?;
+    let plist = parse_plist_payload(&plist_bytes)?;
 
     let partitions = extract_partitions(&plist)?;
 
@@ -304,6 +788,152 @@ fn parse_dmg(path: &Path) -> Result<ParsedDmg> {
         plist,
         partitions,
     })
+}
+
+fn decode_blkx_table(bytes: &[u8]) -> Result<BlkxTable> {
+    if bytes.len() < BLKX_HEADER_SIZE {
+        bail!(
+            "blkx table is truncated: {} bytes, expected at least {BLKX_HEADER_SIZE}",
+            bytes.len()
+        );
+    }
+    if &bytes[..4] != b"mish" {
+        bail!("blkx table has invalid signature");
+    }
+
+    let count_bytes: [u8; 4] = bytes[BLKX_CHUNK_COUNT_OFFSET..BLKX_HEADER_SIZE]
+        .try_into()
+        .expect("fixed-size blkx chunk-count field");
+    let chunk_count = usize::try_from(u32::from_be_bytes(count_bytes))
+        .context("blkx chunk count does not fit usize")?;
+    if chunk_count > MAX_BLKX_CHUNKS {
+        bail!("blkx chunk count {chunk_count} exceeds limit {MAX_BLKX_CHUNKS}");
+    }
+
+    let chunk_bytes = chunk_count
+        .checked_mul(BLKX_CHUNK_SIZE)
+        .ok_or_else(|| anyhow!("blkx chunk table size overflow"))?;
+    let required = BLKX_HEADER_SIZE
+        .checked_add(chunk_bytes)
+        .ok_or_else(|| anyhow!("blkx table size overflow"))?;
+    if required > bytes.len() {
+        bail!(
+            "blkx declares {chunk_count} chunks requiring {required} bytes, but table has {}",
+            bytes.len()
+        );
+    }
+
+    let table =
+        BlkxTable::read_from(&mut Cursor::new(bytes)).context("unable to parse blkx table")?;
+    let expanded_size = table
+        .sector_count
+        .checked_mul(SECTOR_SIZE)
+        .ok_or_else(|| anyhow!("blkx expanded size overflow"))?;
+    if expanded_size > MAX_PARTITION_BYTES {
+        bail!("blkx expanded size {expanded_size} exceeds limit {MAX_PARTITION_BYTES}");
+    }
+
+    let mut expected_sector = 0_u64;
+    let mut total_compressed = 0_u64;
+    let mut saw_terminator = false;
+
+    for (index, chunk) in table.chunks.iter().enumerate() {
+        let sector_end = chunk
+            .sector_number
+            .checked_add(chunk.sector_count)
+            .ok_or_else(|| anyhow!("blkx chunk {index} sector range overflow"))?;
+        chunk
+            .compressed_offset
+            .checked_add(chunk.compressed_length)
+            .ok_or_else(|| anyhow!("blkx chunk {index} compressed range overflow"))?;
+        if chunk.compressed_length > MAX_COMPRESSED_CHUNK_BYTES {
+            bail!(
+                "blkx chunk {index} compressed length {} exceeds limit {}",
+                chunk.compressed_length,
+                MAX_COMPRESSED_CHUNK_BYTES
+            );
+        }
+
+        total_compressed = total_compressed
+            .checked_add(chunk.compressed_length)
+            .ok_or_else(|| anyhow!("blkx aggregate compressed length overflow"))?;
+        if total_compressed > MAX_PARTITION_BYTES {
+            bail!(
+                "blkx aggregate compressed length {total_compressed} exceeds limit {MAX_PARTITION_BYTES}"
+            );
+        }
+
+        match chunk.ty() {
+            Some(ChunkType::Comment) => continue,
+            Some(ChunkType::Term) => {
+                if saw_terminator {
+                    bail!("blkx contains multiple terminator chunks");
+                }
+                if chunk.sector_count != 0 || chunk.compressed_length != 0 {
+                    bail!("blkx terminator chunk {index} contains data");
+                }
+                if chunk.sector_number != expected_sector {
+                    bail!(
+                        "blkx terminator starts at sector {}, expected {expected_sector}",
+                        chunk.sector_number
+                    );
+                }
+                saw_terminator = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if saw_terminator {
+            bail!("blkx data chunk {index} appears after the terminator");
+        }
+        if chunk.sector_count == 0 {
+            bail!("blkx data chunk {index} has zero sectors");
+        }
+        if chunk.sector_number != expected_sector {
+            bail!(
+                "blkx data chunk {index} starts at sector {}, expected {expected_sector}",
+                chunk.sector_number
+            );
+        }
+        if sector_end > table.sector_count {
+            bail!(
+                "blkx data chunk {index} ends at sector {sector_end}, beyond partition sector count {}",
+                table.sector_count
+            );
+        }
+
+        let chunk_expanded = chunk
+            .sector_count
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| anyhow!("blkx chunk {index} expanded size overflow"))?;
+        if chunk_expanded > MAX_EXPANDED_CHUNK_BYTES {
+            bail!(
+                "blkx chunk {index} expanded size {chunk_expanded} exceeds limit {MAX_EXPANDED_CHUNK_BYTES}"
+            );
+        }
+        if matches!(chunk.ty(), Some(ChunkType::Raw | ChunkType::Ignore))
+            && chunk.compressed_length > chunk_expanded
+        {
+            bail!(
+                "blkx raw chunk {index} compressed length {} exceeds expanded size {chunk_expanded}",
+                chunk.compressed_length
+            );
+        }
+        expected_sector = sector_end;
+    }
+
+    if !saw_terminator {
+        bail!("blkx table is missing a terminator chunk");
+    }
+    if expected_sector != table.sector_count {
+        bail!(
+            "blkx chunks cover {expected_sector} sectors, expected {}",
+            table.sector_count
+        );
+    }
+
+    Ok(table)
 }
 
 fn extract_partitions(plist: &Value) -> Result<Vec<PartitionRecord>> {
@@ -318,6 +948,13 @@ fn extract_partitions(plist: &Value) -> Result<Vec<PartitionRecord>> {
         .context("resource-fork missing blkx")?;
     let blkx_entries = expect_array(blkx_value, "resource-fork.blkx")?;
 
+    if blkx_entries.len() > MAX_BLKX_CHUNKS {
+        bail!(
+            "resource-fork.blkx entry count {} exceeds limit {MAX_BLKX_CHUNKS}",
+            blkx_entries.len()
+        );
+    }
+
     let mut partitions = Vec::with_capacity(blkx_entries.len());
 
     for (source_index, entry) in blkx_entries.iter().enumerate() {
@@ -326,11 +963,11 @@ fn extract_partitions(plist: &Value) -> Result<Vec<PartitionRecord>> {
             continue;
         };
         let table_bytes = match data_value {
-            Value::Data(bytes) => bytes.clone(),
+            Value::Data(bytes) => bytes,
             _ => continue,
         };
 
-        let table = BlkxTable::read_from(&mut Cursor::new(&table_bytes))
+        let table = decode_blkx_table(table_bytes)
             .with_context(|| format!("unable to decode blkx table for partition {source_index}"))?;
         let logical_index = partitions.len();
 
@@ -376,7 +1013,16 @@ fn expect_array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
     }
 }
 
-fn read_exact_at<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> Result<Vec<u8>> {
+fn read_exact_at<R: Read + Seek>(
+    reader: &mut R,
+    input_size: u64,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>> {
+    validate_file_range(input_size, offset, length, "chunk payload")?;
+    if length > MAX_COMPRESSED_CHUNK_BYTES {
+        bail!("chunk payload length {length} exceeds limit {MAX_COMPRESSED_CHUNK_BYTES}");
+    }
     let len = usize::try_from(length).context("payload length does not fit usize")?;
     reader
         .seek(SeekFrom::Start(offset))
@@ -388,21 +1034,110 @@ fn read_exact_at<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> Re
     Ok(buffer)
 }
 
-fn decode_chunk<R: Read + Seek>(reader: &mut R, chunk: &BlkxChunk) -> Result<Vec<u8>> {
+fn bounded_decode<R: Read>(decoder: R, output_limit: u64, label: &str) -> Result<Vec<u8>> {
+    let read_limit = output_limit
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("{label} output limit overflow"))?;
+    let mut limited = decoder.take(read_limit);
+    let initial_capacity = usize::try_from(output_limit.min(1024 * 1024))
+        .context("decoder capacity does not fit usize")?;
+    let mut decoded = Vec::with_capacity(initial_capacity);
+    limited
+        .read_to_end(&mut decoded)
+        .with_context(|| format!("unable to {label}-decompress chunk"))?;
+    let decoded_len = u64::try_from(decoded.len()).context("decoded length does not fit u64")?;
+    if decoded_len > output_limit {
+        bail!("{label} output exceeds limit {output_limit}");
+    }
+    Ok(decoded)
+}
+
+fn compressed_output_limit(chunk: &BlkxChunk, remaining_output: u64) -> Result<u64> {
+    let declared = if chunk.sector_count == 0 {
+        remaining_output
+    } else {
+        chunk
+            .sector_count
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| anyhow!("chunk expanded size overflow"))?
+    };
+    if declared > remaining_output {
+        bail!(
+            "chunk expanded size {declared} exceeds remaining partition limit {remaining_output}"
+        );
+    }
+    Ok(declared)
+}
+
+fn decode_chunk<R: Read + Seek>(
+    reader: &mut R,
+    input_size: u64,
+    chunk: &BlkxChunk,
+    remaining_output: u64,
+) -> Result<Vec<u8>> {
     let chunk_type = chunk
         .ty()
         .ok_or_else(|| anyhow!("unknown chunk type: 0x{:08x}", chunk.r#type))?;
 
     match chunk_type {
-        ChunkType::Raw => read_exact_at(reader, chunk.compressed_offset, chunk.compressed_length),
+        ChunkType::Raw => {
+            if chunk.compressed_length > remaining_output {
+                bail!(
+                    "raw chunk length {} exceeds remaining partition limit {remaining_output}",
+                    chunk.compressed_length
+                );
+            }
+            read_exact_at(
+                reader,
+                input_size,
+                chunk.compressed_offset,
+                chunk.compressed_length,
+            )
+        }
         ChunkType::Zlib => {
-            let compressed =
-                read_exact_at(reader, chunk.compressed_offset, chunk.compressed_length)?;
-            let mut decoder = ZlibDecoder::new(&compressed[..]);
-            let mut decoded = Vec::new();
-            decoder
-                .read_to_end(&mut decoded)
-                .context("unable to zlib-decompress chunk")?;
+            let compressed = read_exact_at(
+                reader,
+                input_size,
+                chunk.compressed_offset,
+                chunk.compressed_length,
+            )?;
+            let output_limit = compressed_output_limit(chunk, remaining_output)?;
+            bounded_decode(ZlibDecoder::new(&compressed[..]), output_limit, "zlib")
+        }
+        ChunkType::Bzlib => {
+            let compressed = read_exact_at(
+                reader,
+                input_size,
+                chunk.compressed_offset,
+                chunk.compressed_length,
+            )?;
+            let output_limit = compressed_output_limit(chunk, remaining_output)?;
+            bounded_decode(BzDecoder::new(&compressed[..]), output_limit, "bzip2")
+        }
+        ChunkType::Lzfse => {
+            let compressed = read_exact_at(
+                reader,
+                input_size,
+                chunk.compressed_offset,
+                chunk.compressed_length,
+            )?;
+            if chunk.sector_count == 0 {
+                bail!("LZFSE chunk is missing a declared expanded sector count");
+            }
+            let output_limit = compressed_output_limit(chunk, remaining_output)?;
+            let buffer_len = output_limit
+                .checked_add(1)
+                .and_then(|size| usize::try_from(size).ok())
+                .ok_or_else(|| anyhow!("LZFSE output buffer size overflow"))?;
+            let mut decoded = vec![0_u8; buffer_len];
+            let decoded_len = lzfse::decode_buffer(&compressed, &mut decoded)
+                .map_err(|error| anyhow!("unable to LZFSE-decompress chunk: {error:?}"))?;
+            let decoded_len_u64 =
+                u64::try_from(decoded_len).context("LZFSE decoded length does not fit u64")?;
+            if decoded_len_u64 > output_limit {
+                bail!("LZFSE output exceeds declared size {output_limit}");
+            }
+            decoded.truncate(decoded_len);
             Ok(decoded)
         }
         ChunkType::Zero | ChunkType::Ignore | ChunkType::Comment => {
@@ -414,24 +1149,44 @@ fn decode_chunk<R: Read + Seek>(reader: &mut R, chunk: &BlkxChunk) -> Result<Vec
             } else {
                 chunk.compressed_length
             };
+            if raw_len > remaining_output {
+                bail!(
+                    "zero-fill chunk length {raw_len} exceeds remaining partition limit {remaining_output}"
+                );
+            }
             let len = usize::try_from(raw_len).context("zero-fill length does not fit usize")?;
             Ok(vec![0_u8; len])
         }
         ChunkType::Term => Ok(Vec::new()),
-        ChunkType::Adc | ChunkType::Bzlib | ChunkType::Lzfse => {
-            bail!("unsupported compression type {chunk_type:?}")
+        ChunkType::Adc => {
+            bail!("ADC compression is unsupported by the upstream DMG decoder")
         }
     }
 }
 
 fn read_partition_bytes(path: &Path, partition: &PartitionRecord) -> Result<Vec<u8>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?,
-    );
+    let file =
+        File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?;
+    let input_size = file
+        .metadata()
+        .with_context(|| format!("unable to stat DMG: {}", path.display()))?
+        .len();
+    let mut reader = BufReader::new(file);
 
     let mut out = Vec::new();
     for chunk in &partition.table.chunks {
-        let mut chunk_data = decode_chunk(&mut reader, chunk)?;
+        let current_len = u64::try_from(out.len()).context("partition length does not fit u64")?;
+        let remaining = MAX_PARTITION_BYTES
+            .checked_sub(current_len)
+            .ok_or_else(|| anyhow!("partition output exceeds limit {MAX_PARTITION_BYTES}"))?;
+        let mut chunk_data = decode_chunk(&mut reader, input_size, chunk, remaining)?;
+        let combined = out
+            .len()
+            .checked_add(chunk_data.len())
+            .ok_or_else(|| anyhow!("partition output size overflow"))?;
+        if u64::try_from(combined).unwrap_or(u64::MAX) > MAX_PARTITION_BYTES {
+            bail!("partition output exceeds limit {MAX_PARTITION_BYTES}");
+        }
         out.append(&mut chunk_data);
     }
 
@@ -439,9 +1194,19 @@ fn read_partition_bytes(path: &Path, partition: &PartitionRecord) -> Result<Vec<
 }
 
 fn data_fork_checksum(path: &Path, koly: &KolyTrailer) -> Result<u32> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?,
-    );
+    let file =
+        File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?;
+    let file_size = file
+        .metadata()
+        .with_context(|| format!("unable to stat DMG: {}", path.display()))?
+        .len();
+    validate_file_range(
+        file_size,
+        koly.data_fork_offset,
+        koly.data_fork_length,
+        "data fork",
+    )?;
+    let mut reader = BufReader::new(file);
 
     reader
         .seek(SeekFrom::Start(koly.data_fork_offset))
@@ -450,6 +1215,7 @@ fn data_fork_checksum(path: &Path, koly: &KolyTrailer) -> Result<u32> {
     let mut hasher = Hasher::new();
     let mut limited = (&mut reader).take(koly.data_fork_length);
     let mut buffer = [0_u8; 128 * 1024];
+    let mut total_read = 0_u64;
 
     loop {
         let read = limited
@@ -458,10 +1224,29 @@ fn data_fork_checksum(path: &Path, koly: &KolyTrailer) -> Result<u32> {
         if read == 0 {
             break;
         }
+        total_read = total_read
+            .checked_add(u64::try_from(read).context("checksum read length does not fit u64")?)
+            .ok_or_else(|| anyhow!("checksum read length overflow"))?;
         hasher.update(&buffer[..read]);
     }
 
+    if total_read != koly.data_fork_length {
+        bail!(
+            "data fork ended after {total_read} bytes; expected {}",
+            koly.data_fork_length
+        );
+    }
+
     Ok(hasher.finalize())
+}
+
+fn truncate_metadata_text(text: &str) -> String {
+    let mut characters = text.chars();
+    let mut truncated: String = characters.by_ref().take(MAX_METADATA_VALUE_CHARS).collect();
+    if characters.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn value_to_short_string(value: &Value) -> String {
@@ -471,10 +1256,23 @@ fn value_to_short_string(value: &Value) -> String {
         Value::Date(date) => format!("{date:?}"),
         Value::Real(real) => real.to_string(),
         Value::Integer(int) => format!("{int:?}"),
-        Value::String(s) => s.clone(),
+        Value::String(s) => truncate_metadata_text(s),
         Value::Array(values) => {
-            let parts: Vec<String> = values.iter().map(value_to_short_string).collect();
-            format!("[{}]", parts.join(", "))
+            const MAX_PREVIEW_ITEMS: usize = 16;
+            let parts: Vec<String> = values
+                .iter()
+                .take(MAX_PREVIEW_ITEMS)
+                .map(|item| match item {
+                    Value::Array(_) => "<array>".to_string(),
+                    other => value_to_short_string(other),
+                })
+                .collect();
+            let suffix = if values.len() > MAX_PREVIEW_ITEMS {
+                ", …"
+            } else {
+                ""
+            };
+            truncate_metadata_text(&format!("[{}{suffix}]", parts.join(", ")))
         }
         Value::Dictionary(_) => "<dictionary>".to_string(),
         other => format!("{other:?}"),
@@ -511,17 +1309,35 @@ fn plist_to_json(value: &Value) -> JsonValue {
     }
 }
 
-fn push_candidate(target: &mut Vec<MetadataCandidate>, path: &[String], key: &str, value: &Value) {
+fn push_candidate(
+    target: &mut Vec<MetadataCandidate>,
+    path: &[String],
+    key: &str,
+    value: &Value,
+    count: &mut usize,
+) {
+    if *count >= MAX_METADATA_CANDIDATES {
+        return;
+    }
     let rendered = value_to_short_string(value);
     target.push(MetadataCandidate {
-        path: path.join("."),
-        key: key.to_string(),
+        path: truncate_metadata_text(&path.join(".")),
+        key: truncate_metadata_text(key),
         value: rendered,
     });
+    *count += 1;
 }
 
 fn collect_metadata_candidates(value: &Value) -> MetadataCandidates {
-    fn walk(value: &Value, path: &mut Vec<String>, out: &mut MetadataCandidates) {
+    fn walk(
+        value: &Value,
+        path: &mut Vec<String>,
+        out: &mut MetadataCandidates,
+        count: &mut usize,
+    ) {
+        if *count >= MAX_METADATA_CANDIDATES {
+            return;
+        }
         match value {
             Value::Dictionary(dict) => {
                 for (key, child) in dict {
@@ -535,7 +1351,7 @@ fn collect_metadata_candidates(value: &Value) -> MetadataCandidates {
                         || key_lower.contains("modified")
                         || key_lower.contains("timestamp")
                     {
-                        push_candidate(&mut out.creation_dates, path, key, child);
+                        push_candidate(&mut out.creation_dates, path, key, child, count);
                     }
 
                     if key_lower.contains("author")
@@ -543,7 +1359,7 @@ fn collect_metadata_candidates(value: &Value) -> MetadataCandidates {
                         || key_lower.contains("owner")
                         || key_lower.contains("publisher")
                     {
-                        push_candidate(&mut out.authors, path, key, child);
+                        push_candidate(&mut out.authors, path, key, child, count);
                     }
 
                     if key_lower.contains("application")
@@ -553,17 +1369,17 @@ fn collect_metadata_candidates(value: &Value) -> MetadataCandidates {
                         || key_lower.contains("generator")
                         || key_lower.contains("creator")
                     {
-                        push_candidate(&mut out.creation_applications, path, key, child);
+                        push_candidate(&mut out.creation_applications, path, key, child, count);
                     }
 
-                    walk(child, path, out);
+                    walk(child, path, out, count);
                     let _ = path.pop();
                 }
             }
             Value::Array(values) => {
                 for (index, child) in values.iter().enumerate() {
                     path.push(index.to_string());
-                    walk(child, path, out);
+                    walk(child, path, out, count);
                     let _ = path.pop();
                 }
             }
@@ -573,7 +1389,8 @@ fn collect_metadata_candidates(value: &Value) -> MetadataCandidates {
 
     let mut out = MetadataCandidates::default();
     let mut path = Vec::new();
-    walk(value, &mut path, &mut out);
+    let mut count = 0;
+    walk(value, &mut path, &mut out, &mut count);
     out
 }
 
@@ -695,19 +1512,123 @@ fn gpt_header_to_info(header: &gpt::header::Header) -> GptHeaderInfo {
     }
 }
 
+fn read_backup_gpt_header(
+    bytes: &[u8],
+    block_size: LogicalBlockSize,
+) -> Option<gpt::header::Header> {
+    let block_bytes = logical_block_size_bytes(block_size);
+    let input_size = u64::try_from(bytes.len()).ok()?;
+    if input_size < block_bytes.checked_mul(3)? {
+        return None;
+    }
+
+    // Match `gpt`'s backup-header lookup, including its behavior for an input
+    // whose size is not an exact multiple of the logical block size. The public
+    // arbitrary-device helper always reads LBA 1, so present the backup block as
+    // the second block of a subslice.
+    let backup_lba = input_size.saturating_sub(block_bytes) / block_bytes;
+    let backup_offset = backup_lba.checked_mul(block_bytes)?;
+    let subslice_start = backup_offset.checked_sub(block_bytes)?;
+    let subslice_start = usize::try_from(subslice_start).ok()?;
+    let mut device = Cursor::new(bytes.get(subslice_start..)?);
+    gpt::header::read_header_from_arbitrary_device(&mut device, block_size).ok()
+}
+
+fn validate_gpt_header(
+    bytes: &[u8],
+    block_size: LogicalBlockSize,
+    header_name: &str,
+    header: &gpt::header::Header,
+) -> Result<()> {
+    if header.part_size != 128 {
+        bail!(
+            "{header_name} GPT partition entry size {} is unsupported; expected 128",
+            header.part_size
+        );
+    }
+    if header.num_parts > MAX_GPT_PARTITIONS {
+        bail!(
+            "{header_name} GPT partition count {} exceeds limit {MAX_GPT_PARTITIONS}",
+            header.num_parts
+        );
+    }
+
+    let block_bytes = logical_block_size_bytes(block_size);
+    let table_offset = header
+        .part_start
+        .checked_mul(block_bytes)
+        .ok_or_else(|| anyhow!("{header_name} GPT partition table offset overflow"))?;
+    let table_length = u64::from(header.num_parts)
+        .checked_mul(u64::from(header.part_size))
+        .ok_or_else(|| anyhow!("{header_name} GPT partition table length overflow"))?;
+    let input_size = u64::try_from(bytes.len()).context("GPT input size exceeds u64")?;
+    validate_file_range(
+        input_size,
+        table_offset,
+        table_length,
+        &format!("{header_name} GPT partition table"),
+    )?;
+
+    let table_start = usize::try_from(table_offset).context("GPT table offset exceeds usize")?;
+    let table_end = usize::try_from(
+        table_offset
+            .checked_add(table_length)
+            .ok_or_else(|| anyhow!("{header_name} GPT partition table end overflow"))?,
+    )
+    .context("GPT table end exceeds usize")?;
+    let computed_crc32 = crc32fast::hash(
+        bytes
+            .get(table_start..table_end)
+            .ok_or_else(|| anyhow!("{header_name} GPT partition table is out of bounds"))?,
+    );
+    if computed_crc32 != header.crc32_parts {
+        bail!(
+            "{header_name} GPT partition table CRC32 mismatch: declared {:#010x}, computed {computed_crc32:#010x}",
+            header.crc32_parts
+        );
+    }
+
+    Ok(())
+}
+
+fn preflight_gpt(bytes: &[u8], block_size: LogicalBlockSize) -> Result<()> {
+    let mut primary_device = Cursor::new(bytes);
+    let primary =
+        gpt::header::read_header_from_arbitrary_device(&mut primary_device, block_size).ok();
+    let backup = read_backup_gpt_header(bytes, block_size);
+
+    if let Some(header) = primary.as_ref() {
+        validate_gpt_header(bytes, block_size, "primary", header)
+    } else if let Some(header) = backup.as_ref() {
+        validate_gpt_header(bytes, block_size, "backup", header)
+    } else {
+        // The dependency will return its detailed invalid-header error without
+        // attempting to read a partition array.
+        Ok(())
+    }
+}
+
 fn parse_gpt_from_bytes(bytes: &[u8]) -> std::result::Result<ParsedGpt, Vec<String>> {
     let mut errors = Vec::new();
     let block_sizes = [LogicalBlockSize::Lb512, LogicalBlockSize::Lb4096];
 
     for block_size in block_sizes {
         let lb_bytes = logical_block_size_bytes(block_size);
-        let device = Cursor::new(bytes.to_vec());
+        if let Err(error) = preflight_gpt(bytes, block_size) {
+            errors.push(format!("LBA {lb_bytes}: {error}"));
+            continue;
+        }
+
+        let device = ReadOnlyDevice::new(bytes);
         let config = GptConfig::new()
             .writable(false)
             .logical_block_size(block_size)
             .only_valid_headers(false);
 
-        match config.open_from_device(device) {
+        let opened = catch_dependency_panic("GPT parsing", || {
+            config.open_from_device(device).map_err(anyhow::Error::from)
+        });
+        match opened {
             Ok(disk) => {
                 let primary_header = disk.primary_header().ok().map(gpt_header_to_info);
                 let backup_header = disk.backup_header().ok().map(gpt_header_to_info);
@@ -763,6 +1684,10 @@ fn fat_type_name(fat_type: FatType) -> &'static str {
     }
 }
 
+fn open_fat_filesystem(bytes: Vec<u8>) -> io::Result<FileSystem<BudgetedIo<Cursor<Vec<u8>>>>> {
+    FileSystem::new(BudgetedIo::new(Cursor::new(bytes)), FsOptions::new())
+}
+
 fn detect_fat_filesystems(
     path: &Path,
     partitions: &[PartitionRecord],
@@ -782,53 +1707,325 @@ fn detect_fat_filesystems(
             }
         };
 
-        let fs = match FileSystem::new(Cursor::new(bytes), FsOptions::new()) {
-            Ok(fs) => fs,
-            Err(_) => continue,
-        };
+        let detected = catch_dependency_panic("FAT filesystem detection", || {
+            let fs = match open_fat_filesystem(bytes) {
+                Ok(fs) => fs,
+                Err(_) => return Ok(None),
+            };
 
-        let stats = fs.stats().ok();
-        let root_volume_label = fs.read_volume_label_from_root_dir().ok().flatten();
+            let stats = fs
+                .stats()
+                .context("unable to read FAT filesystem statistics")?;
+            let root_volume_label = fs
+                .read_volume_label_from_root_dir()
+                .context("unable to read FAT root volume label")?;
 
-        filesystems.push(FatFilesystemMetadata {
-            partition_index: partition.index,
-            partition_name: partition.name.clone(),
-            fat_type: fat_type_name(fs.fat_type()).to_string(),
-            volume_id: fs.volume_id(),
-            volume_label: fs.volume_label(),
-            root_volume_label,
-            cluster_size: stats.map(|s| s.cluster_size()),
-            total_clusters: stats.map(|s| s.total_clusters()),
-            free_clusters: stats.map(|s| s.free_clusters()),
+            Ok(Some(FatFilesystemMetadata {
+                partition_index: partition.index,
+                partition_name: partition.name.clone(),
+                fat_type: fat_type_name(fs.fat_type()).to_string(),
+                volume_id: fs.volume_id(),
+                volume_label: fs.volume_label(),
+                root_volume_label,
+                cluster_size: Some(stats.cluster_size()),
+                total_clusters: Some(stats.total_clusters()),
+                free_clusters: Some(stats.free_clusters()),
+            }))
         });
+
+        match detected {
+            Ok(Some(filesystem)) => filesystems.push(filesystem),
+            Ok(None) => {}
+            Err(error) => errors.push(format!(
+                "partition {} ({}) FAT inspection failed: {error}",
+                partition.index, partition.name
+            )),
+        }
     }
 
     (filesystems, errors)
 }
 
-fn fs_type_name(fs_type: dpp::FsType) -> &'static str {
-    match fs_type {
-        dpp::FsType::HfsPlus => "hfsplus",
-        dpp::FsType::Apfs => "apfs",
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn catch_dependency_panic<T>(operation: &str, callback: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(callback)) {
+        Ok(result) => result,
+        Err(payload) => bail!(
+            "{operation} rejected malformed input after an upstream parser panic: {}",
+            panic_payload_message(payload.as_ref())
+        ),
+    }
+}
+
+fn validate_apple_partition_size(size: u64) -> Result<()> {
+    if size > MAX_PARTITION_BYTES {
+        bail!("filesystem image size {size} exceeds limit {MAX_PARTITION_BYTES}");
+    }
+    Ok(())
+}
+
+fn reader_size<R: Seek>(reader: &mut R) -> Result<u64> {
+    let original = reader
+        .stream_position()
+        .context("unable to read filesystem image position")?;
+    let size = reader
+        .seek(SeekFrom::End(0))
+        .context("unable to determine filesystem image size")?;
+    reader
+        .seek(SeekFrom::Start(original))
+        .context("unable to restore filesystem image position")?;
+    Ok(size)
+}
+
+fn validate_hfs_reader<R: Read + Seek>(reader: &mut R) -> Result<()> {
+    let file_size = reader_size(reader)?;
+    validate_apple_partition_size(file_size)?;
+    reader
+        .seek(SeekFrom::Start(HFS_VOLUME_HEADER_OFFSET))
+        .context("unable to seek to HFS+ volume header")?;
+    let mut prefix = [0_u8; HFS_VOLUME_HEADER_PREFIX_SIZE];
+    reader
+        .read_exact(&mut prefix)
+        .context("unable to read HFS+ volume header")?;
+
+    if !matches!(&prefix[..2], b"H+" | b"HX") {
+        bail!("filesystem image has no HFS+/HFSX signature");
+    }
+    let block_size = u32::from_be_bytes(
+        prefix[40..44]
+            .try_into()
+            .expect("fixed-size HFS+ block-size field"),
+    );
+    if !(HFS_MIN_ALLOCATION_BLOCK_BYTES..=MAX_HFS_ALLOCATION_BLOCK_BYTES).contains(&block_size)
+        || !block_size.is_power_of_two()
+    {
+        bail!(
+            "HFS+ allocation block size {block_size} is outside the supported power-of-two range {HFS_MIN_ALLOCATION_BLOCK_BYTES}..={MAX_HFS_ALLOCATION_BLOCK_BYTES}"
+        );
+    }
+
+    let total_blocks = u32::from_be_bytes(
+        prefix[44..48]
+            .try_into()
+            .expect("fixed-size HFS+ total-blocks field"),
+    );
+    let volume_size = u64::from(block_size)
+        .checked_mul(u64::from(total_blocks))
+        .ok_or_else(|| anyhow!("HFS+ volume size overflow"))?;
+    if total_blocks == 0 || volume_size > file_size {
+        bail!(
+            "HFS+ volume declares {volume_size} bytes in {total_blocks} blocks, beyond image size {file_size}"
+        );
+    }
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("unable to rewind HFS+ image")?;
+    Ok(())
+}
+
+fn validate_apfs_block_size(block_size: u32) -> Result<()> {
+    if !(APFS_MIN_BLOCK_BYTES..=APFS_MAX_BLOCK_BYTES).contains(&block_size)
+        || !block_size.is_power_of_two()
+    {
+        bail!(
+            "APFS block size {block_size} is outside the supported power-of-two range {APFS_MIN_BLOCK_BYTES}..={APFS_MAX_BLOCK_BYTES}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_apfs_superblock(nxsb: &apfs::superblock::NxSuperblock, file_size: u64) -> Result<()> {
+    validate_apfs_block_size(nxsb.block_size)?;
+    let container_size = nxsb
+        .block_count
+        .checked_mul(u64::from(nxsb.block_size))
+        .ok_or_else(|| anyhow!("APFS container size overflow"))?;
+    if nxsb.block_count == 0 || container_size > file_size {
+        bail!(
+            "APFS container declares {container_size} bytes in {} blocks, beyond image size {file_size}",
+            nxsb.block_count
+        );
+    }
+    if nxsb.xp_desc_blocks > MAX_APFS_CHECKPOINT_BLOCKS {
+        bail!(
+            "APFS checkpoint descriptor count {} exceeds limit {MAX_APFS_CHECKPOINT_BLOCKS}",
+            nxsb.xp_desc_blocks
+        );
+    }
+    let checkpoint_end = nxsb
+        .xp_desc_base
+        .checked_add(u64::from(nxsb.xp_desc_blocks))
+        .ok_or_else(|| anyhow!("APFS checkpoint descriptor range overflow"))?;
+    if checkpoint_end > nxsb.block_count {
+        bail!(
+            "APFS checkpoint descriptor range ends at block {checkpoint_end}, beyond container block count {}",
+            nxsb.block_count
+        );
+    }
+    Ok(())
+}
+
+fn validate_apfs_reader<R: Read + Seek>(reader: &mut R) -> Result<()> {
+    let file_size = reader_size(reader)?;
+    validate_apple_partition_size(file_size)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("unable to seek to APFS container superblock")?;
+    let mut prefix = [0_u8; APFS_SUPERBLOCK_PREFIX_SIZE];
+    reader
+        .read_exact(&mut prefix)
+        .context("unable to read APFS container superblock prefix")?;
+    if &prefix[32..36] != b"NXSB" {
+        bail!("filesystem image has no APFS container signature");
+    }
+    let block_size = u32::from_le_bytes(
+        prefix[36..40]
+            .try_into()
+            .expect("fixed-size APFS block-size field"),
+    );
+    validate_apfs_block_size(block_size)?;
+    let block_count = u64::from_le_bytes(
+        prefix[40..48]
+            .try_into()
+            .expect("fixed-size APFS block-count field"),
+    );
+    let container_size = block_count
+        .checked_mul(u64::from(block_size))
+        .ok_or_else(|| anyhow!("APFS container size overflow"))?;
+    if block_count == 0 || container_size > file_size {
+        bail!(
+            "APFS container declares {container_size} bytes in {block_count} blocks, beyond image size {file_size}"
+        );
+    }
+
+    let nxsb = apfs::superblock::read_nxsb(reader)
+        .context("unable to validate APFS container superblock")?;
+    validate_apfs_superblock(&nxsb, file_size)?;
+    let latest = apfs::superblock::find_latest_nxsb(reader, &nxsb)
+        .context("unable to validate APFS checkpoint superblocks")?;
+    validate_apfs_superblock(&latest, file_size)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("unable to rewind APFS image")?;
+    Ok(())
+}
+
+fn open_hfs_volume<R: Read + Seek>(mut reader: R) -> Result<hfsplus::HfsVolume<R>> {
+    validate_hfs_reader(&mut reader)?;
+    hfsplus::HfsVolume::open(reader).context("unable to parse HFS+ filesystem")
+}
+
+fn open_apfs_volume<R: Read + Seek>(mut reader: R) -> Result<apfs::ApfsVolume<R>> {
+    validate_apfs_reader(&mut reader)?;
+    apfs::ApfsVolume::open(reader).context("unable to parse APFS filesystem")
+}
+
+fn verify_streaming_data_fork_checksum(path: &Path, koly: &KolyTrailer) -> Result<()> {
+    let declared = u32::from(koly.data_fork_digest);
+    if koly.data_fork_digest.r#type != 2 || declared == 0 {
+        return Ok(());
+    }
+    let computed = data_fork_checksum(path, koly)?;
+    if computed != declared {
+        bail!("DMG data-fork CRC32 mismatch: declared {declared:08x}, computed {computed:08x}");
+    }
+    Ok(())
+}
+
+fn open_udif_apple_filesystem(path: &Path) -> Result<AppleFsHandle> {
+    let parsed =
+        parse_dmg(path).context("DMG boundary validation failed before filesystem extraction")?;
+    verify_streaming_data_fork_checksum(path, &parsed.koly)?;
+
+    let mut archive = UdifDmgArchive::open_with_options(
+        path,
+        UdifDmgReaderOptions {
+            // udif's verifier materializes the entire attacker-controlled data
+            // fork. The repository performs the equivalent CRC32 check above
+            // with a fixed-size streaming buffer.
+            verify_checksums: false,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "unable to open DMG filesystem container: {}",
+            path.display()
+        )
+    })?;
+    let partitions = archive.partitions();
+    let partition = partitions
+        .iter()
+        .filter(|partition| partition.partition_type.is_hfs_compatible())
+        .max_by_key(|partition| partition.size)
+        .or_else(|| {
+            partitions
+                .iter()
+                .filter(|partition| partition.partition_type == UdifPartitionType::Apfs)
+                .max_by_key(|partition| partition.size)
+        })
+        .ok_or_else(|| anyhow!("DMG has no HFS+/HFSX/APFS partition"))?
+        .clone();
+
+    validate_apple_partition_size(partition.size)?;
+
+    let mut temporary = tempfile().context("unable to create temporary filesystem partition")?;
+    let (reported, written) = {
+        let mut limited = LimitedWriter::new(&mut temporary, MAX_PARTITION_BYTES);
+        let reported = archive
+            .extract_partition_to(partition.id, &mut limited)
+            .with_context(|| format!("unable to extract DMG partition {}", partition.id))?;
+        limited
+            .flush()
+            .context("unable to flush temporary filesystem partition")?;
+        (reported, limited.written())
+    };
+    if reported != written {
+        bail!("DMG filesystem extractor reported {reported} bytes but wrote {written}");
+    }
+
+    temporary
+        .seek(SeekFrom::Start(0))
+        .context("unable to rewind temporary filesystem partition")?;
+    let reader = BudgetedIo::new(BufReader::new(temporary));
+
+    match partition.partition_type {
+        UdifPartitionType::Hfs | UdifPartitionType::Hfsx => {
+            let volume =
+                open_hfs_volume(reader).context("unable to parse extracted HFS+ filesystem")?;
+            Ok(AppleFsHandle::Hfs(Box::new(volume)))
+        }
+        UdifPartitionType::Apfs => {
+            let volume =
+                open_apfs_volume(reader).context("unable to parse extracted APFS filesystem")?;
+            Ok(AppleFsHandle::Apfs(Box::new(volume)))
+        }
+        UdifPartitionType::Other => bail!("selected DMG partition has no supported filesystem"),
     }
 }
 
 fn open_apple_filesystem(path: &Path) -> Result<AppleFsHandle> {
     let mut errors = Vec::new();
 
-    match DmgPipeline::open(path) {
-        Ok(mut pipeline) => match pipeline.open_filesystem() {
-            Ok(filesystem) => return Ok(AppleFsHandle::Dmg(filesystem)),
-            Err(error) => errors.push(format!("dmg filesystem detection failed: {error}")),
-        },
-        Err(error) => errors.push(format!("dmg pipeline open failed: {error}")),
+    match open_udif_apple_filesystem(path) {
+        Ok(filesystem) => return Ok(filesystem),
+        Err(error) => errors.push(format!("DMG filesystem detection failed: {error}")),
     }
 
     match File::open(path) {
         Ok(file) => {
-            let reader = BufReader::new(file);
-            match dpp::hfsplus::HfsVolume::open(reader) {
-                Ok(volume) => return Ok(AppleFsHandle::HfsRaw(volume)),
+            let reader = BudgetedIo::new(BufReader::new(file));
+            match open_hfs_volume(reader) {
+                Ok(volume) => return Ok(AppleFsHandle::Hfs(Box::new(volume))),
                 Err(error) => errors.push(format!("raw HFS+ parse failed: {error}")),
             }
         }
@@ -839,9 +2036,9 @@ fn open_apple_filesystem(path: &Path) -> Result<AppleFsHandle> {
 
     match File::open(path) {
         Ok(file) => {
-            let reader = BufReader::new(file);
-            match dpp::apfs::ApfsVolume::open(reader) {
-                Ok(volume) => return Ok(AppleFsHandle::ApfsRaw(volume)),
+            let reader = BudgetedIo::new(BufReader::new(file));
+            match open_apfs_volume(reader) {
+                Ok(volume) => return Ok(AppleFsHandle::Apfs(Box::new(volume))),
                 Err(error) => errors.push(format!("raw APFS parse failed: {error}")),
             }
         }
@@ -859,42 +2056,7 @@ fn open_apple_filesystem(path: &Path) -> Result<AppleFsHandle> {
 
 fn apple_metadata_from_handle(handle: &mut AppleFsHandle) -> AppleFilesystemMetadata {
     match handle {
-        AppleFsHandle::Dmg(filesystem) => {
-            let info = filesystem.volume_info();
-            let mut metadata = AppleFilesystemMetadata {
-                fs_type: fs_type_name(info.fs_type).to_string(),
-                block_size: info.block_size,
-                file_count: info.file_count,
-                directory_count: info.directory_count,
-                volume_name: info.name.clone(),
-                symlink_count: info.symlink_count,
-                total_blocks: info.total_blocks,
-                free_blocks: info.free_blocks,
-                version: info.version,
-                is_hfsx: info.is_hfsx,
-                volume_create_time: None,
-                volume_modify_time: None,
-                root_create_time: None,
-                root_modify_time: None,
-            };
-
-            match filesystem {
-                FilesystemHandle::Hfs(hfs) => {
-                    let header = hfs.volume_header();
-                    metadata.volume_create_time = Some(i64::from(header.create_date));
-                    metadata.volume_modify_time = Some(i64::from(header.modify_date));
-                }
-                FilesystemHandle::Apfs(apfs) => {
-                    if let Ok(root) = apfs.stat("/") {
-                        metadata.root_create_time = Some(root.create_time);
-                        metadata.root_modify_time = Some(root.modify_time);
-                    }
-                }
-            }
-
-            metadata
-        }
-        AppleFsHandle::HfsRaw(hfs) => {
+        AppleFsHandle::Hfs(hfs) => {
             let header = hfs.volume_header();
             let block_size = header.block_size;
             let file_count = u64::from(header.file_count);
@@ -930,7 +2092,7 @@ fn apple_metadata_from_handle(handle: &mut AppleFsHandle) -> AppleFilesystemMeta
                 root_modify_time,
             }
         }
-        AppleFsHandle::ApfsRaw(apfs) => {
+        AppleFsHandle::Apfs(apfs) => {
             let info = apfs.volume_info();
             let block_size = info.block_size;
             let file_count = info.num_files;
@@ -963,8 +2125,10 @@ fn apple_metadata_from_handle(handle: &mut AppleFsHandle) -> AppleFilesystemMeta
 }
 
 fn inspect_apple_filesystem_metadata(path: &Path) -> Result<AppleFilesystemMetadata> {
-    let mut handle = open_apple_filesystem(path)?;
-    Ok(apple_metadata_from_handle(&mut handle))
+    catch_dependency_panic("Apple filesystem metadata inspection", || {
+        let mut handle = open_apple_filesystem(path)?;
+        Ok(apple_metadata_from_handle(&mut handle))
+    })
 }
 
 fn inspect_filesystems_impl(path: &Path) -> Result<FilesystemsInspection> {
@@ -1024,102 +2188,195 @@ fn join_apple_entry_path(parent: &str, name: &str) -> String {
 }
 
 fn list_apple_entries_impl(path: &Path, directory_path: &str) -> Result<Vec<AppleFsEntry>> {
-    let normalized_dir = normalize_apple_path(directory_path);
-    let mut handle = open_apple_filesystem(path)?;
+    catch_dependency_panic("Apple filesystem directory listing", || {
+        let normalized_dir = normalize_apple_path(directory_path);
+        let mut handle = open_apple_filesystem(path)?;
 
-    match &mut handle {
-        AppleFsHandle::Dmg(filesystem) => {
-            let entries = filesystem
+        let entries = match &mut handle {
+            AppleFsHandle::Hfs(hfs) => hfs
                 .list_directory(&normalized_dir)
-                .with_context(|| format!("unable to list directory: {normalized_dir}"))?;
-            Ok(entries
+                .with_context(|| format!("unable to list directory: {normalized_dir}"))?
                 .into_iter()
                 .map(|entry| AppleFsEntry {
                     path: join_apple_entry_path(&normalized_dir, &entry.name),
-                    is_dir: matches!(entry.kind, dpp::FsEntryKind::Directory),
+                    is_dir: matches!(entry.kind, hfsplus::EntryKind::Directory),
                     size: entry.size,
                 })
-                .collect::<Vec<_>>())
-        }
-        AppleFsHandle::HfsRaw(hfs) => {
-            let entries = hfs
+                .collect::<Vec<_>>(),
+            AppleFsHandle::Apfs(apfs) => apfs
                 .list_directory(&normalized_dir)
-                .with_context(|| format!("unable to list directory: {normalized_dir}"))?;
-            Ok(entries
+                .with_context(|| format!("unable to list directory: {normalized_dir}"))?
                 .into_iter()
                 .map(|entry| AppleFsEntry {
                     path: join_apple_entry_path(&normalized_dir, &entry.name),
-                    is_dir: matches!(entry.kind, dpp::hfsplus::EntryKind::Directory),
+                    is_dir: matches!(entry.kind, apfs::EntryKind::Directory),
                     size: entry.size,
                 })
-                .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+        };
+
+        if entries.len() > MAX_FILESYSTEM_ENTRIES {
+            bail!(
+                "directory entry count {} exceeds limit {MAX_FILESYSTEM_ENTRIES}",
+                entries.len()
+            );
         }
-        AppleFsHandle::ApfsRaw(apfs) => {
-            let entries = apfs
-                .list_directory(&normalized_dir)
-                .with_context(|| format!("unable to list directory: {normalized_dir}"))?;
-            Ok(entries
-                .into_iter()
-                .map(|entry| AppleFsEntry {
-                    path: join_apple_entry_path(&normalized_dir, &entry.name),
-                    is_dir: matches!(entry.kind, dpp::apfs::EntryKind::Directory),
-                    size: entry.size,
-                })
-                .collect::<Vec<_>>())
+        Ok(entries)
+    })
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
         }
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "write length does not fit u64")
+        })?;
+        let new_total = self
+            .written
+            .checked_add(requested)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output length overflow"))?;
+        if new_total > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("output exceeds safety limit {} bytes", self.limit),
+            ));
+        }
+
+        let written = self.inner.write(buffer)?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "write count does not fit u64")
+            })?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output length overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn output_parent(output_path: &Path) -> &Path {
+    output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_atomic_output(output_path: &Path) -> Result<NamedTempFile> {
+    let parent = output_parent(output_path);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("unable to create output directory: {}", parent.display()))?;
+    NamedTempFile::new_in(parent)
+        .with_context(|| format!("unable to create temporary output in {}", parent.display()))
+}
+
+fn persist_atomic_output(mut temporary: NamedTempFile, output_path: &Path) -> Result<()> {
+    temporary.flush().with_context(|| {
+        format!(
+            "unable to flush temporary output for {}",
+            output_path.display()
+        )
+    })?;
+    temporary.as_file().sync_all().with_context(|| {
+        format!(
+            "unable to synchronize temporary output for {}",
+            output_path.display()
+        )
+    })?;
+    temporary
+        .persist(output_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("unable to atomically replace {}", output_path.display()))?;
+    Ok(())
+}
+
+fn write_apple_file_to<W: Write>(
+    handle: &mut AppleFsHandle,
+    normalized_path: &str,
+    writer: &mut W,
+) -> Result<u64> {
+    match handle {
+        AppleFsHandle::Hfs(hfs) => hfs
+            .read_file_to(normalized_path, writer)
+            .with_context(|| format!("unable to read filesystem file: {normalized_path}")),
+        AppleFsHandle::Apfs(apfs) => apfs
+            .read_file_to(normalized_path, writer)
+            .with_context(|| format!("unable to read filesystem file: {normalized_path}")),
     }
 }
 
 fn read_apple_file_impl(path: &Path, file_path: &str) -> Result<Vec<u8>> {
-    let normalized_path = normalize_apple_path(file_path);
-    let mut handle = open_apple_filesystem(path)?;
-
-    match &mut handle {
-        AppleFsHandle::Dmg(filesystem) => filesystem
-            .read_file(&normalized_path)
-            .with_context(|| format!("unable to read filesystem file: {normalized_path}")),
-        AppleFsHandle::HfsRaw(hfs) => hfs
-            .read_file(&normalized_path)
-            .with_context(|| format!("unable to read filesystem file: {normalized_path}")),
-        AppleFsHandle::ApfsRaw(apfs) => apfs
-            .read_file(&normalized_path)
-            .with_context(|| format!("unable to read filesystem file: {normalized_path}")),
-    }
+    catch_dependency_panic("Apple filesystem file read", || {
+        let normalized_path = normalize_apple_path(file_path);
+        let mut handle = open_apple_filesystem(path)?;
+        let mut output = Vec::new();
+        let (reported, written) = {
+            let mut limited = LimitedWriter::new(&mut output, MAX_APPLE_FILE_BYTES);
+            let reported = write_apple_file_to(&mut handle, &normalized_path, &mut limited)?;
+            limited
+                .flush()
+                .context("unable to finalize filesystem file read")?;
+            (reported, limited.written())
+        };
+        if reported != written {
+            bail!("filesystem reported {reported} bytes but wrote {written}");
+        }
+        Ok(output)
+    })
 }
 
 fn extract_apple_file_impl(path: &Path, file_path: &str, output_path: &Path) -> Result<u64> {
     let normalized_path = normalize_apple_path(file_path);
-    let mut handle = open_apple_filesystem(path)?;
-
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("unable to create output directory: {}", parent.display())
-            })?;
+    let mut temporary = create_atomic_output(output_path)?;
+    let written = catch_dependency_panic("Apple filesystem file extraction", || {
+        let mut handle = open_apple_filesystem(path)?;
+        let mut limited = LimitedWriter::new(&mut temporary, MAX_APPLE_FILE_BYTES);
+        let reported = write_apple_file_to(&mut handle, &normalized_path, &mut limited)?;
+        limited
+            .flush()
+            .context("unable to finalize filesystem file extraction")?;
+        if reported != limited.written() {
+            bail!(
+                "filesystem reported {reported} bytes but wrote {}",
+                limited.written()
+            );
         }
-    }
-
-    let mut destination = File::create(output_path)
-        .with_context(|| format!("unable to create output file: {}", output_path.display()))?;
-    let written = match &mut handle {
-        AppleFsHandle::Dmg(filesystem) => filesystem
-            .read_file_to(&normalized_path, &mut destination)
-            .with_context(|| {
-                format!("unable to extract file from filesystem: {normalized_path}")
-            })?,
-        AppleFsHandle::HfsRaw(hfs) => hfs
-            .read_file_to(&normalized_path, &mut destination)
-            .with_context(|| {
-                format!("unable to extract file from filesystem: {normalized_path}")
-            })?,
-        AppleFsHandle::ApfsRaw(apfs) => apfs
-            .read_file_to(&normalized_path, &mut destination)
-            .with_context(|| {
-                format!("unable to extract file from filesystem: {normalized_path}")
-            })?,
-    };
-    destination.flush()?;
+        Ok(limited.written())
+    })?;
+    persist_atomic_output(temporary, output_path)?;
     Ok(written)
+}
+
+fn create_dmg_with_dependency(
+    source: &Path,
+    output: &Path,
+    volume_label: &str,
+    total_sectors: u32,
+) -> Result<()> {
+    catch_dependency_panic("DMG creation", || {
+        apple_dmg::create_dmg(source, output, volume_label, total_sectors)
+    })
 }
 
 fn inspect_impl(path: &Path) -> Result<DmgInfo> {
@@ -1225,6 +2482,7 @@ fn list_partitions_impl(path: &Path) -> Result<Vec<PartitionInfo>> {
     Ok(parsed.partitions.iter().map(to_partition_info).collect())
 }
 
+#[cfg(feature = "python")]
 fn ensure_partition(
     partitions: &[PartitionRecord],
     index: usize,
@@ -1256,24 +2514,66 @@ fn is_special_fat_entry(name: &str) -> bool {
     name.is_empty() || name == "." || name == ".."
 }
 
+#[derive(Default)]
+struct FilesystemBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+impl FilesystemBudget {
+    fn visit(&mut self, depth: usize) -> Result<()> {
+        if depth > MAX_FILESYSTEM_DEPTH {
+            bail!("filesystem nesting exceeds depth limit {MAX_FILESYSTEM_DEPTH}");
+        }
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("filesystem entry count overflow"))?;
+        if self.entries > MAX_FILESYSTEM_ENTRIES {
+            bail!("filesystem entry count exceeds limit {MAX_FILESYSTEM_ENTRIES}");
+        }
+        Ok(())
+    }
+
+    fn add_file_bytes(&mut self, size: u64) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("filesystem byte count overflow"))?;
+        if self.bytes > MAX_PARTITION_BYTES {
+            bail!("filesystem output exceeds limit {MAX_PARTITION_BYTES}");
+        }
+        Ok(())
+    }
+}
+
 fn list_fat32_entries_impl(path: &Path, partition_index: usize) -> Result<Vec<Fat32Entry>> {
+    catch_dependency_panic("FAT32 directory listing", || {
+        list_fat32_entries_unchecked(path, partition_index)
+    })
+}
+
+fn list_fat32_entries_unchecked(path: &Path, partition_index: usize) -> Result<Vec<Fat32Entry>> {
     let parsed = parse_dmg(path)?;
     let partition = parsed
         .partitions
         .get(partition_index)
         .ok_or_else(|| anyhow!("partition index {partition_index} out of range"))?;
     let bytes = read_partition_bytes(path, partition)?;
-    let fs = FileSystem::new(Cursor::new(bytes), FsOptions::new())
+    let fs = open_fat_filesystem(bytes)
         .context("unable to open FAT32 filesystem from partition data")?;
 
     let mut entries = Vec::new();
-    collect_dir_entries(fs.root_dir(), PathBuf::new(), &mut entries)?;
+    let mut budget = FilesystemBudget::default();
+    collect_dir_entries(fs.root_dir(), PathBuf::new(), 0, &mut budget, &mut entries)?;
     Ok(entries)
 }
 
 fn collect_dir_entries<T: ReadWriteSeek>(
     dir: fatfs::Dir<'_, T>,
     prefix: PathBuf,
+    depth: usize,
+    budget: &mut FilesystemBudget,
     entries: &mut Vec<Fat32Entry>,
 ) -> Result<()> {
     for entry in dir.iter() {
@@ -1282,6 +2582,7 @@ fn collect_dir_entries<T: ReadWriteSeek>(
         if is_special_fat_entry(name.as_str()) {
             continue;
         }
+        budget.visit(depth)?;
         let rel_path = if prefix.as_os_str().is_empty() {
             PathBuf::from(name)
         } else {
@@ -1302,13 +2603,140 @@ fn collect_dir_entries<T: ReadWriteSeek>(
         });
 
         if is_dir {
-            collect_dir_entries(entry.to_dir(), rel_path, entries)?;
+            collect_dir_entries(entry.to_dir(), rel_path, depth + 1, budget, entries)?;
+        } else if let Some(size) = size {
+            budget.add_file_bytes(size)?;
         }
     }
     Ok(())
 }
 
+fn ensure_safe_output_root(output_dir: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(output_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "output directory must not be a symlink: {}",
+                    output_dir.display()
+                );
+            }
+            if !metadata.is_dir() {
+                bail!("output path is not a directory: {}", output_dir.display());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(output_dir).with_context(|| {
+                format!(
+                    "unable to create output directory for FAT32 extraction: {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "unable to inspect output directory: {}",
+                    output_dir.display()
+                )
+            });
+        }
+    }
+
+    let metadata = fs::symlink_metadata(output_dir).with_context(|| {
+        format!(
+            "unable to inspect output directory: {}",
+            output_dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("unsafe output directory: {}", output_dir.display());
+    }
+    output_dir.canonicalize().with_context(|| {
+        format!(
+            "unable to resolve output directory: {}",
+            output_dir.display()
+        )
+    })
+}
+
+fn ensure_safe_subdirectory(
+    output_root: &Path,
+    canonical_root: &Path,
+    relative: &Path,
+) -> Result<PathBuf> {
+    let mut current = output_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!("unsafe output path component in {}", relative.display());
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("refusing to traverse output symlink: {}", current.display());
+                }
+                if !metadata.is_dir() {
+                    bail!(
+                        "output path component is not a directory: {}",
+                        current.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| {
+                    format!(
+                        "unable to create extraction directory: {}",
+                        current.display()
+                    )
+                })?;
+                let metadata = fs::symlink_metadata(&current).with_context(|| {
+                    format!(
+                        "unable to inspect extraction directory: {}",
+                        current.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("unsafe extraction directory: {}", current.display());
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to inspect extraction directory: {}",
+                        current.display()
+                    )
+                });
+            }
+        }
+
+        let resolved = current.canonicalize().with_context(|| {
+            format!(
+                "unable to resolve extraction directory: {}",
+                current.display()
+            )
+        })?;
+        if !resolved.starts_with(canonical_root) {
+            bail!(
+                "extraction directory escapes output root: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(current)
+}
+
 fn extract_fat32_impl(
+    path: &Path,
+    output_dir: &Path,
+    partition_index: usize,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    catch_dependency_panic("FAT32 extraction", || {
+        extract_fat32_unchecked(path, output_dir, partition_index, overwrite)
+    })
+}
+
+fn extract_fat32_unchecked(
     path: &Path,
     output_dir: &Path,
     partition_index: usize,
@@ -1320,34 +2748,36 @@ fn extract_fat32_impl(
         .get(partition_index)
         .ok_or_else(|| anyhow!("partition index {partition_index} out of range"))?;
     let bytes = read_partition_bytes(path, partition)?;
-    let fs = FileSystem::new(Cursor::new(bytes), FsOptions::new())
+    let fs = open_fat_filesystem(bytes)
         .context("unable to open FAT32 filesystem from partition data")?;
 
-    fs::create_dir_all(output_dir).with_context(|| {
-        format!(
-            "unable to create output directory for FAT32 extraction: {}",
-            output_dir.display()
-        )
-    })?;
+    let canonical_root = ensure_safe_output_root(output_dir)?;
 
-    let mut extracted = Vec::new();
-    extract_dir_entries(
-        fs.root_dir(),
-        output_dir,
-        PathBuf::new(),
+    let mut context = FatExtractionContext {
+        output_root: output_dir,
+        canonical_root: &canonical_root,
         overwrite,
-        &mut extracted,
-    )?;
+        budget: FilesystemBudget::default(),
+        extracted: Vec::new(),
+    };
+    extract_dir_entries(fs.root_dir(), PathBuf::new(), 0, &mut context)?;
 
-    Ok(extracted)
+    Ok(context.extracted)
+}
+
+struct FatExtractionContext<'a> {
+    output_root: &'a Path,
+    canonical_root: &'a Path,
+    overwrite: bool,
+    budget: FilesystemBudget,
+    extracted: Vec<String>,
 }
 
 fn extract_dir_entries<T: ReadWriteSeek>(
     dir: fatfs::Dir<'_, T>,
-    output_root: &Path,
     prefix: PathBuf,
-    overwrite: bool,
-    extracted: &mut Vec<String>,
+    depth: usize,
+    context: &mut FatExtractionContext<'_>,
 ) -> Result<()> {
     for entry in dir.iter() {
         let entry = entry?;
@@ -1355,76 +2785,223 @@ fn extract_dir_entries<T: ReadWriteSeek>(
         if is_special_fat_entry(name.as_str()) {
             continue;
         }
+        context.budget.visit(depth)?;
         let rel_path = if prefix.as_os_str().is_empty() {
             PathBuf::from(name)
         } else {
             prefix.join(name)
         };
         let normalized = normalize_relative_path(&rel_path)?;
-        let destination = output_root.join(&rel_path);
 
         if entry.is_dir() {
-            fs::create_dir_all(&destination).with_context(|| {
-                format!(
-                    "unable to create directory during extraction: {}",
-                    destination.display()
-                )
-            })?;
-            extracted.push(normalized.clone());
-            extract_dir_entries(entry.to_dir(), output_root, rel_path, overwrite, extracted)?;
+            ensure_safe_subdirectory(context.output_root, context.canonical_root, &rel_path)?;
+            context.extracted.push(normalized.clone());
+            extract_dir_entries(entry.to_dir(), rel_path, depth + 1, context)?;
             continue;
         }
 
-        if destination.exists() && !overwrite {
+        let parent_relative = rel_path.parent().unwrap_or_else(|| Path::new(""));
+        let parent =
+            ensure_safe_subdirectory(context.output_root, context.canonical_root, parent_relative)?;
+        let destination = context.output_root.join(&rel_path);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "refusing to overwrite output symlink: {}",
+                        destination.display()
+                    );
+                }
+                if metadata.is_dir() {
+                    bail!("output file path is a directory: {}", destination.display());
+                }
+                if !context.overwrite {
+                    bail!(
+                        "refusing to overwrite existing file {} (set overwrite=True)",
+                        destination.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to inspect output file: {}", destination.display())
+                });
+            }
+        }
+
+        let file_size = entry.len();
+        context.budget.add_file_bytes(file_size)?;
+        let mut source = entry.to_file();
+        let mut temporary = NamedTempFile::new_in(&parent).with_context(|| {
+            format!(
+                "unable to create temporary extraction file in {}",
+                parent.display()
+            )
+        })?;
+        let (written, limited_written) = {
+            let mut limited = LimitedWriter::new(&mut temporary, file_size);
+            let written = std::io::copy(&mut source, &mut limited).with_context(|| {
+                format!("unable to write extracted file: {}", destination.display())
+            })?;
+            limited.flush()?;
+            (written, limited.written())
+        };
+        if written != file_size || limited_written != file_size {
             bail!(
-                "refusing to overwrite existing file {} (set overwrite=True)",
+                "extracted file {} wrote {written} bytes; expected {file_size}",
                 destination.display()
             );
         }
-
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("unable to create parent directory: {}", parent.display())
-            })?;
+        temporary.as_file().sync_all()?;
+        if context.overwrite {
+            temporary
+                .persist(&destination)
+                .map_err(|error| error.error)
+                .with_context(|| {
+                    format!("unable to atomically replace {}", destination.display())
+                })?;
+        } else {
+            temporary
+                .persist_noclobber(&destination)
+                .map_err(|error| error.error)
+                .with_context(|| {
+                    format!("unable to atomically create {}", destination.display())
+                })?;
         }
 
-        let mut source = entry.to_file();
-        let mut destination_file = File::create(&destination).with_context(|| {
-            format!("unable to create extracted file: {}", destination.display())
-        })?;
-        std::io::copy(&mut source, &mut destination_file).with_context(|| {
-            format!("unable to write extracted file: {}", destination.display())
-        })?;
-        destination_file.flush()?;
-
-        extracted.push(normalized);
+        context.extracted.push(normalized);
     }
 
     Ok(())
 }
 
+/// Internal entry points used by the `cargo-fuzz` targets.
+///
+/// These functions intentionally discard parser errors: fuzzing is looking for
+/// panics, aborts, sanitizer findings, hangs, and uncontrolled resource use.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::*;
+
+    const CHUNK_TYPES: [u32; 10] = [
+        ChunkType::Zero as u32,
+        ChunkType::Raw as u32,
+        ChunkType::Ignore as u32,
+        ChunkType::Comment as u32,
+        ChunkType::Adc as u32,
+        ChunkType::Zlib as u32,
+        ChunkType::Bzlib as u32,
+        ChunkType::Lzfse as u32,
+        ChunkType::Term as u32,
+        0xdead_beef,
+    ];
+
+    pub fn dmg_parse(data: &[u8]) {
+        let mut reader = Cursor::new(data);
+        let _ = parse_dmg_reader(&mut reader, data.len() as u64);
+    }
+
+    pub fn blkx(data: &[u8]) {
+        let _ = decode_blkx_table(data);
+    }
+
+    pub fn gpt(data: &[u8]) {
+        let _ = parse_gpt_from_bytes(data);
+    }
+
+    pub fn chunk(data: &[u8]) {
+        const HEADER_LEN: usize = 25;
+        const MAX_ZERO_SECTORS: u64 = 4096;
+
+        if data.len() < HEADER_LEN {
+            return;
+        }
+
+        let selector = usize::from(data[0]) % CHUNK_TYPES.len();
+        let sector_count = read_u64(&data[1..9]) % (MAX_ZERO_SECTORS + 1);
+        let offset_seed = read_u64(&data[9..17]);
+        let length_seed = read_u64(&data[17..25]);
+        let payload = &data[HEADER_LEN..];
+
+        let offset = usize::try_from(offset_seed % (payload.len() as u64 + 1)).unwrap_or(0);
+        let available = payload.len().saturating_sub(offset);
+        let length = usize::try_from(length_seed % (available as u64 + 1)).unwrap_or(0);
+
+        let chunk = BlkxChunk {
+            r#type: CHUNK_TYPES[selector],
+            comment: 0,
+            sector_number: 0,
+            sector_count,
+            compressed_offset: offset as u64,
+            compressed_length: length as u64,
+        };
+        let _ = decode_chunk(
+            &mut Cursor::new(payload),
+            payload.len() as u64,
+            &chunk,
+            MAX_PARTITION_BYTES,
+        );
+    }
+
+    pub fn image(path: &Path) {
+        if let Ok(partitions) = list_partitions_impl(path) {
+            // Exercise recursive FAT directory parsing without letting a single
+            // image with thousands of partitions monopolize the campaign.
+            for partition in partitions.iter().take(16) {
+                let _ = list_fat32_entries_impl(path, partition.index);
+            }
+        }
+
+        // Metadata inspection does not traverse Apple filesystem directories.
+        // Listing the root and reading a small number of files reaches catalog,
+        // inode, extent, and file-content paths driven by untrusted metadata.
+        if let Ok(entries) = list_apple_entries_impl(path, "/") {
+            for entry in entries.iter().filter(|entry| !entry.is_dir).take(2) {
+                let _ = read_apple_file_impl(path, &entry.path);
+            }
+        }
+
+        let _ = inspect_gpt_impl(path, None);
+        let _ = inspect_filesystems_impl(path);
+        let _ = inspect_impl(path);
+    }
+
+    fn read_u64(bytes: &[u8]) -> u64 {
+        let mut array = [0_u8; 8];
+        array.copy_from_slice(bytes);
+        u64::from_le_bytes(array)
+    }
+}
+
+#[cfg(feature = "python")]
 fn to_py_runtime_error(error: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn inspect_json(path: &str) -> PyResult<String> {
     let info = inspect_impl(Path::new(path)).map_err(to_py_runtime_error)?;
     serde_json::to_string(&info).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn inspect_filesystems_json(path: &str) -> PyResult<String> {
     let info = inspect_filesystems_impl(Path::new(path)).map_err(to_py_runtime_error)?;
     serde_json::to_string(&info).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn list_partitions_json(path: &str) -> PyResult<String> {
     let info = list_partitions_impl(Path::new(path)).map_err(to_py_runtime_error)?;
     serde_json::to_string(&info).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (path, partition_index=None, strict=false))]
 fn inspect_gpt_json(path: &str, partition_index: Option<usize>, strict: bool) -> PyResult<String> {
@@ -1452,14 +3029,16 @@ fn inspect_gpt_json(path: &str, partition_index: Option<usize>, strict: bool) ->
     serde_json::to_string(&inspection).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn read_partition(py: Python<'_>, path: &str, index: usize) -> PyResult<Py<PyBytes>> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
     let partition = ensure_partition(&parsed.partitions, index)?;
     let data = read_partition_bytes(Path::new(path), partition).map_err(to_py_runtime_error)?;
-    Ok(PyBytes::new_bound(py, &data).into())
+    Ok(PyBytes::new(py, &data).unbind())
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn extract_partition(path: &str, index: usize, output_path: &str) -> PyResult<u64> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
@@ -1467,30 +3046,23 @@ fn extract_partition(path: &str, index: usize, output_path: &str) -> PyResult<u6
     let data = read_partition_bytes(Path::new(path), partition).map_err(to_py_runtime_error)?;
 
     let output = Path::new(output_path);
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        }
-    }
-
-    let mut writer =
-        File::create(output).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    writer
+    let mut temporary = create_atomic_output(output).map_err(to_py_runtime_error)?;
+    temporary
         .write_all(&data)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    writer
-        .flush()
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        .map_err(|error| to_py_runtime_error(error.into()))?;
+    persist_atomic_output(temporary, output).map_err(to_py_runtime_error)?;
 
     u64::try_from(data.len()).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn compute_data_checksum(path: &str) -> PyResult<u32> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
     data_fork_checksum(Path::new(path), &parsed.koly).map_err(to_py_runtime_error)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn verify_data_checksum(path: &str) -> PyResult<bool> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
@@ -1500,6 +3072,7 @@ fn verify_data_checksum(path: &str) -> PyResult<bool> {
     Ok(declared == computed)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn list_fat32_entries_json(path: &str, partition_index: usize) -> PyResult<String> {
     let entries = list_fat32_entries_impl(Path::new(path), partition_index).map_err(|error| {
@@ -1514,6 +3087,7 @@ fn list_fat32_entries_json(path: &str, partition_index: usize) -> PyResult<Strin
     serde_json::to_string(&entries).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (path, output_dir, partition_index=1, overwrite=false))]
 fn extract_fat32_json(
@@ -1540,6 +3114,7 @@ fn extract_fat32_json(
     serde_json::to_string(&extracted).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (path, directory_path="/"))]
 fn list_apple_entries_json(path: &str, directory_path: &str) -> PyResult<String> {
@@ -1548,18 +3123,21 @@ fn list_apple_entries_json(path: &str, directory_path: &str) -> PyResult<String>
     serde_json::to_string(&entries).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn read_apple_file(py: Python<'_>, path: &str, file_path: &str) -> PyResult<Py<PyBytes>> {
     let data = read_apple_file_impl(Path::new(path), file_path).map_err(to_py_runtime_error)?;
-    Ok(PyBytes::new_bound(py, &data).into())
+    Ok(PyBytes::new(py, &data).unbind())
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn extract_apple_file(path: &str, file_path: &str, output_path: &str) -> PyResult<u64> {
     extract_apple_file_impl(Path::new(path), file_path, Path::new(output_path))
         .map_err(to_py_runtime_error)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (source_dir, output_path, volume_label="PYDMG", total_sectors=32768))]
 fn create_dmg(
@@ -1577,6 +3155,15 @@ fn create_dmg(
         ));
     }
 
+    let output_bytes = u64::from(total_sectors)
+        .checked_mul(SECTOR_SIZE)
+        .ok_or_else(|| PyValueError::new_err("requested DMG size overflows u64"))?;
+    if output_bytes > MAX_PARTITION_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "requested DMG size {output_bytes} exceeds safety limit {MAX_PARTITION_BYTES}"
+        )));
+    }
+
     if !source.exists() {
         return Err(PyValueError::new_err(format!(
             "source directory does not exist: {}",
@@ -1591,15 +3178,13 @@ fn create_dmg(
         )));
     }
 
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        }
-    }
-
-    apple_dmg::create_dmg(source, output, volume_label, total_sectors).map_err(to_py_runtime_error)
+    let temporary = create_atomic_output(output).map_err(to_py_runtime_error)?;
+    create_dmg_with_dependency(source, temporary.path(), volume_label, total_sectors)
+        .map_err(to_py_runtime_error)?;
+    persist_atomic_output(temporary, output).map_err(to_py_runtime_error)
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn _pydmg(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_json, module)?)?;
@@ -1617,4 +3202,353 @@ fn _pydmg(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(extract_apple_file, module)?)?;
     module.add_function(wrap_pyfunction!(create_dmg, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bzip2::{write::BzEncoder, Compression as BzCompression};
+    use flate2::{write::ZlibEncoder, Compression as ZlibCompression};
+
+    fn compressed_chunk(kind: ChunkType, compressed_length: usize) -> BlkxChunk {
+        BlkxChunk {
+            r#type: kind as u32,
+            comment: 0,
+            sector_number: 0,
+            sector_count: 1,
+            compressed_offset: 0,
+            compressed_length: compressed_length as u64,
+        }
+    }
+
+    fn encode_blkx(table: &BlkxTable) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        table.write_to(&mut encoded).expect("encode blkx table");
+        encoded
+    }
+
+    #[test]
+    fn blkx_rejects_unbounded_chunk_count_before_parsing() {
+        let mut table = vec![0_u8; BLKX_HEADER_SIZE];
+        table[..4].copy_from_slice(b"mish");
+        table[BLKX_CHUNK_COUNT_OFFSET..BLKX_HEADER_SIZE].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_blkx_table(&table).expect_err("oversized count must be rejected");
+        assert!(error.to_string().contains("chunk count"));
+    }
+
+    #[test]
+    fn blkx_rejects_truncated_chunk_array() {
+        let mut table = vec![0_u8; BLKX_HEADER_SIZE];
+        table[..4].copy_from_slice(b"mish");
+        table[BLKX_CHUNK_COUNT_OFFSET..BLKX_HEADER_SIZE].copy_from_slice(&1_u32.to_be_bytes());
+
+        let error = decode_blkx_table(&table).expect_err("truncated table must be rejected");
+        assert!(error.to_string().contains("requiring"));
+    }
+
+    #[test]
+    fn blkx_rejects_gaps_and_large_dependency_allocations() {
+        let mut gapped = BlkxTable {
+            sector_count: 2,
+            ..BlkxTable::default()
+        };
+        gapped.chunks = vec![
+            BlkxChunk::new(ChunkType::Raw, 1, 1, 0, SECTOR_SIZE),
+            BlkxChunk::term(2, SECTOR_SIZE),
+        ];
+        let error = decode_blkx_table(&encode_blkx(&gapped))
+            .expect_err("non-contiguous output must be rejected");
+        assert!(error.to_string().contains("starts at sector"));
+
+        let oversized_sectors = MAX_EXPANDED_CHUNK_BYTES / SECTOR_SIZE + 1;
+        let mut oversized = BlkxTable {
+            sector_count: oversized_sectors,
+            ..BlkxTable::default()
+        };
+        oversized.chunks = vec![
+            BlkxChunk::new(ChunkType::Zero, 0, oversized_sectors, 0, 0),
+            BlkxChunk::term(oversized_sectors, 0),
+        ];
+        let error = decode_blkx_table(&encode_blkx(&oversized))
+            .expect_err("oversized dependency allocation must be rejected");
+        assert!(error.to_string().contains("expanded size"));
+    }
+
+    #[test]
+    fn filesystem_preflight_rejects_attacker_controlled_block_sizes() {
+        let mut hfs = vec![0_u8; HFS_VOLUME_HEADER_OFFSET as usize + 48];
+        let header = HFS_VOLUME_HEADER_OFFSET as usize;
+        hfs[header..header + 2].copy_from_slice(b"H+");
+        hfs[header + 40..header + 44].copy_from_slice(&u32::MAX.to_be_bytes());
+        let error = validate_hfs_reader(&mut Cursor::new(hfs))
+            .expect_err("oversized HFS+ allocation block must be rejected");
+        assert!(error.to_string().contains("allocation block size"));
+
+        let mut apfs = vec![0_u8; APFS_SUPERBLOCK_PREFIX_SIZE];
+        apfs[32..36].copy_from_slice(b"NXSB");
+        apfs[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = validate_apfs_reader(&mut Cursor::new(apfs))
+            .expect_err("oversized APFS block must be rejected");
+        assert!(error.to_string().contains("APFS block size"));
+    }
+
+    #[test]
+    fn file_ranges_reject_overflow_and_eof() {
+        assert!(validate_file_range(10, 11, 0, "test").is_err());
+        assert!(validate_file_range(10, 9, 2, "test").is_err());
+        assert!(validate_file_range(u64::MAX, u64::MAX, 1, "test").is_err());
+        assert!(validate_file_range(10, 10, 0, "test").is_ok());
+    }
+
+    #[test]
+    fn compressed_decoders_round_trip_with_bounds() {
+        let payload = vec![b'p'; SECTOR_SIZE as usize];
+
+        let mut zlib_encoder = ZlibEncoder::new(Vec::new(), ZlibCompression::default());
+        zlib_encoder.write_all(&payload).expect("encode zlib input");
+        let zlib = zlib_encoder.finish().expect("finish zlib stream");
+        let zlib_chunk = compressed_chunk(ChunkType::Zlib, zlib.len());
+        assert_eq!(
+            decode_chunk(
+                &mut Cursor::new(&zlib),
+                zlib.len() as u64,
+                &zlib_chunk,
+                SECTOR_SIZE,
+            )
+            .expect("decode zlib stream"),
+            payload
+        );
+
+        let mut bzip_encoder = BzEncoder::new(Vec::new(), BzCompression::default());
+        bzip_encoder
+            .write_all(&payload)
+            .expect("encode bzip2 input");
+        let bzip = bzip_encoder.finish().expect("finish bzip2 stream");
+        let bzip_chunk = compressed_chunk(ChunkType::Bzlib, bzip.len());
+        assert_eq!(
+            decode_chunk(
+                &mut Cursor::new(&bzip),
+                bzip.len() as u64,
+                &bzip_chunk,
+                SECTOR_SIZE,
+            )
+            .expect("decode bzip2 stream"),
+            payload
+        );
+
+        let mut lzfse_buffer = vec![0_u8; payload.len() * 2];
+        let lzfse_len =
+            lzfse::encode_buffer(&payload, &mut lzfse_buffer).expect("encode LZFSE input");
+        lzfse_buffer.truncate(lzfse_len);
+        let lzfse_chunk = compressed_chunk(ChunkType::Lzfse, lzfse_buffer.len());
+        assert_eq!(
+            decode_chunk(
+                &mut Cursor::new(&lzfse_buffer),
+                lzfse_buffer.len() as u64,
+                &lzfse_chunk,
+                SECTOR_SIZE,
+            )
+            .expect("decode LZFSE stream"),
+            payload
+        );
+    }
+
+    #[test]
+    fn compressed_decoder_rejects_expansion_past_declared_sectors() {
+        let payload = vec![0_u8; (SECTOR_SIZE * 2) as usize];
+        let mut encoder = ZlibEncoder::new(Vec::new(), ZlibCompression::default());
+        encoder.write_all(&payload).expect("encode zlib input");
+        let compressed = encoder.finish().expect("finish zlib stream");
+        let chunk = compressed_chunk(ChunkType::Zlib, compressed.len());
+
+        let error = decode_chunk(
+            &mut Cursor::new(&compressed),
+            compressed.len() as u64,
+            &chunk,
+            SECTOR_SIZE,
+        )
+        .expect_err("oversized expansion must be rejected");
+        assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn deeply_nested_plist_is_rejected() {
+        let mut value = Value::String("leaf".to_string());
+        for _ in 0..=MAX_PLIST_DEPTH {
+            value = Value::Array(vec![value]);
+        }
+        assert!(validate_plist_structure(&value).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_plist_is_rejected_while_streaming() {
+        let mut xml = String::from("<plist version=\"1.0\">");
+        for _ in 0..=MAX_PLIST_DEPTH {
+            xml.push_str("<array>");
+        }
+        xml.push_str("<string>leaf</string>");
+        for _ in 0..=MAX_PLIST_DEPTH {
+            xml.push_str("</array>");
+        }
+        xml.push_str("</plist>");
+
+        let error = parse_plist_payload(xml.as_bytes())
+            .expect_err("streaming parser must enforce the nesting limit");
+        assert!(error.to_string().contains("nesting-depth limit"));
+    }
+
+    #[test]
+    fn binary_plist_collection_allocation_is_preflighted() {
+        let mut bytes = b"bplist00".to_vec();
+        bytes.push(0xaf); // Array with an extended length.
+        bytes.push(0x12); // Four-byte unsigned length.
+        bytes.extend_from_slice(&(MAX_PLIST_NODES as u32 + 1).to_be_bytes());
+        let offset_table_offset = bytes.len() as u64;
+        bytes.push(8); // The single object starts immediately after the magic.
+
+        let mut trailer = [0_u8; 32];
+        trailer[6] = 1; // One-byte object offsets.
+        trailer[7] = 1; // One-byte object references.
+        trailer[8..16].copy_from_slice(&1_u64.to_be_bytes());
+        trailer[16..24].copy_from_slice(&0_u64.to_be_bytes());
+        trailer[24..32].copy_from_slice(&offset_table_offset.to_be_bytes());
+        bytes.extend_from_slice(&trailer);
+
+        let error = preflight_binary_plist(&bytes)
+            .expect_err("oversized binary collection must be rejected before allocation");
+        assert!(error.to_string().contains("collection length"));
+        assert!(error.to_string().contains("node limit"));
+    }
+
+    #[test]
+    fn dependency_panics_become_regular_errors() {
+        let error = catch_dependency_panic::<()>("test dependency", || {
+            panic!("synthetic dependency panic")
+        })
+        .expect_err("panic must be contained");
+        let message = error.to_string();
+        assert!(message.contains("test dependency"));
+        assert!(message.contains("upstream parser panic"));
+    }
+
+    #[test]
+    fn filesystem_io_budget_rejects_repeated_reads_and_excess_bytes() {
+        let mut operation_limited = BudgetedIo::with_limits(Cursor::new(vec![1_u8, 2, 3]), 16, 1);
+        let mut byte = [0_u8; 1];
+        operation_limited
+            .read_exact(&mut byte)
+            .expect("first read is within the operation budget");
+        let error = operation_limited
+            .read_exact(&mut byte)
+            .expect_err("second read must exceed the operation budget");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("operation budget"));
+
+        let mut byte_limited = BudgetedIo::with_limits(Cursor::new(vec![1_u8, 2, 3]), 2, 16);
+        let error = byte_limited
+            .read_exact(&mut [0_u8; 3])
+            .expect_err("read beyond the byte budget must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("byte budget"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dmg_creation_contains_path_dependency_panic() {
+        let destination = tempfile::tempdir().expect("create destination directory");
+        let error = create_dmg_with_dependency(
+            Path::new("/"),
+            &destination.path().join("output.dmg"),
+            "TEST",
+            32_768,
+        )
+        .expect_err("dependency panic must be contained");
+        let message = error.to_string();
+        assert!(message.contains("DMG creation"));
+        assert!(message.contains("upstream parser panic"));
+    }
+
+    #[test]
+    fn filesystem_partition_limits_declared_and_written_bytes() {
+        assert!(validate_apple_partition_size(MAX_PARTITION_BYTES).is_ok());
+        assert!(validate_apple_partition_size(MAX_PARTITION_BYTES + 1).is_err());
+
+        let mut output = Vec::new();
+        let error = LimitedWriter::new(&mut output, 3)
+            .write_all(&[1, 2, 3, 4])
+            .expect_err("writer must reject output beyond its limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn parses_a_valid_gpt_image() {
+        const TOTAL_BYTES: usize = 1024 * 70;
+        let mut disk = GptConfig::new()
+            .writable(true)
+            .logical_block_size(LogicalBlockSize::Lb512)
+            .create_from_device(Cursor::new(vec![0_u8; TOTAL_BYTES]), None)
+            .expect("create in-memory GPT");
+        disk.add_partition("test", 4096, gpt::partition_types::BASIC, 0, None)
+            .expect("add GPT partition");
+        let device = disk.write().expect("write GPT headers");
+        let bytes = device.into_inner();
+
+        let parsed = parse_gpt_from_bytes(&bytes).expect("parse valid GPT");
+        assert_eq!(parsed.logical_block_size, SECTOR_SIZE);
+        assert_eq!(parsed.partitions.len(), 1);
+        assert_eq!(parsed.partitions[0].name, "test");
+        assert!(parsed.validation.primary_header_valid);
+    }
+
+    #[test]
+    fn gpt_partition_entry_size_assertion_is_preflighted() {
+        const TOTAL_BYTES: usize = 1024 * 70;
+        const PRIMARY_HEADER_OFFSET: usize = 512;
+        const HEADER_LENGTH: usize = 92;
+        const HEADER_CRC_OFFSET: usize = 16;
+        const PARTITION_SIZE_OFFSET: usize = 84;
+
+        let disk = GptConfig::new()
+            .writable(true)
+            .logical_block_size(LogicalBlockSize::Lb512)
+            .create_from_device(Cursor::new(vec![0_u8; TOTAL_BYTES]), None)
+            .expect("create in-memory GPT");
+        let device = disk.write().expect("write GPT headers");
+        let mut bytes = device.into_inner();
+
+        let header = &mut bytes[PRIMARY_HEADER_OFFSET..PRIMARY_HEADER_OFFSET + HEADER_LENGTH];
+        header[PARTITION_SIZE_OFFSET..PARTITION_SIZE_OFFSET + 4]
+            .copy_from_slice(&129_u32.to_le_bytes());
+        header[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].fill(0);
+        let crc32 = crc32fast::hash(header);
+        header[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc32.to_le_bytes());
+
+        let contained = catch_unwind(AssertUnwindSafe(|| parse_gpt_from_bytes(&bytes)))
+            .expect("crafted GPT must not panic");
+        let errors = contained.expect_err("unsupported entry size must be rejected");
+        assert!(errors.iter().any(|error| error.contains("entry size 129")));
+    }
+
+    #[test]
+    fn gpt_partition_table_crc_mismatch_is_rejected() {
+        const TOTAL_BYTES: usize = 1024 * 70;
+        const PRIMARY_TABLE_OFFSET: usize = 2 * 512;
+
+        let disk = GptConfig::new()
+            .writable(true)
+            .logical_block_size(LogicalBlockSize::Lb512)
+            .create_from_device(Cursor::new(vec![0_u8; TOTAL_BYTES]), None)
+            .expect("create in-memory GPT");
+        let device = disk.write().expect("write GPT headers");
+        let mut bytes = device.into_inner();
+        bytes[PRIMARY_TABLE_OFFSET] ^= 0xff;
+
+        let errors = parse_gpt_from_bytes(&bytes)
+            .expect_err("partition table CRC mismatch must be rejected");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("partition table CRC32 mismatch")));
+    }
 }

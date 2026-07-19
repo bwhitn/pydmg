@@ -1,0 +1,6 @@
+[advisories]
+ignore = []
+severity_threshold = "low"
+
+[yanked]
+enabled = true

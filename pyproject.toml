@@ -44,15 +44,27 @@ test = [
   "pytest>=8.0",
 ]
 dev = [
+  "bandit>=1.7.10",
+  "coverage[toml]>=7.6",
   "maturin>=1.7,<2.0",
+  "mypy>=1.13,<2",
+  "pip-audit>=2.7",
   "pytest>=8.0",
   "ruff>=0.8.0",
+  "tomli>=2.0; python_version < '3.11'",
+  "twine>=6.2,<7",
 ]
 
 [tool.maturin]
 module-name = "pydmg._pydmg"
 python-source = "python"
-features = ["pyo3/extension-module"]
+features = ["python", "pyo3/extension-module"]
+locked = true
+include = [
+  { path = "fuzz/Cargo.toml", format = "sdist" },
+  { path = "fuzz/dictionaries/*", format = "sdist" },
+  { path = "fuzz/fuzz_targets/*.rs", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -60,3 +72,20 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "UP"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["python/pydmg", "typing_tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["python/pydmg"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
