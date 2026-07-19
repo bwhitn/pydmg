@@ -529,6 +529,18 @@ occurrences now use immutable SHAs for the current official Node.js 24 releases:
 setup-python 6.3.0, upload-artifact 7.0.1, and download-artifact 8.0.1. This removes reliance on the
 hosted runner's compatibility override without weakening full-SHA pinning.
 
+### QA-018 — The fuzz workflow did not validate changes to its own definition
+
+- Severity: **Low gate coverage**
+- Status: **Resolved locally and guarded by hosted CI**
+
+The fuzz workflow's pull-request filter covered parser, corpus, fixture, and fuzz-harness changes
+but omitted `.github/workflows/fuzz.yml`. A pull request that changed only its action pins therefore
+started normal CI without exercising the updated fuzz jobs. The workflow now includes its own path,
+so future changes to the fuzz gate trigger the four bounded PR smoke targets. Release-only action
+pins are validated with a non-tag manual release run; the PyPI job remains restricted to version
+tags.
+
 ## Fuzzing evidence
 
 Initial campaigns used `cargo-fuzz 0.13.2`, nightly Rust, sanitizer-instrumented standard library,
