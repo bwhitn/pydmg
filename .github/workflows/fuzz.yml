@@ -3,6 +3,7 @@ name: Fuzz
 on:
   pull_request:
     paths:
+      - ".github/workflows/fuzz.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "fuzz/**"
