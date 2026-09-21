@@ -157,6 +157,18 @@ corpus/artifact directories:
 No crash artifact, timeout, or sanitizer report was produced. These are bounded single-host
 campaigns; the scheduled and release jobs remain the canonical recurring gates.
 
+The 0.1.3 corrective BLKX validation patch reran every target with the same toolchain, sanitizer,
+structure-aware corpus preparation, and owner-only artifact handling. No crash artifact, timeout,
+or sanitizer report was produced:
+
+| Target | Budget | Executions | Coverage / features | Peak RSS | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dmg_parse` | 30 s | 16,616 | 1,683 / 4,077 | 528 MB | No finding |
+| `blkx` | 30 s | 582,777 | 240 / 487 | 437 MB | No finding |
+| `chunk` | 30 s | 207,159 | 964 / 2,353 | 375 MB | No finding |
+| `gpt` | 30 s | 28,858 | 686 / 1,335 | 531 MB | No finding |
+| `image` | 300 s | 2,789 | 5,663 / 12,485 | 1,164 MB | No finding |
+
 ## Known instrumentation limits
 
 - Native libraries built by dependency build scripts may not receive the same sanitizer coverage as

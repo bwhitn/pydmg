@@ -770,6 +770,35 @@ artifact records 90% Python and 79.78% native lines. Its published performance a
 [`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) passed all four PR
 fuzz-smoke jobs; whole-image fuzz was skipped by its documented PR policy.
 
+## 0.1.3 corrective compatibility verification
+
+After the immutable 0.1.2 release was published, downstream acceptance against an authorized Apple
+filesystem image exposed a compatibility regression in the new BLKX preflight. One valid
+`Ignore` chunk represented 82,345,984 expanded bytes, which exceeded the 64 MiB per-decoder-chunk
+limit even though `Ignore` and `Zero` chunks are emitted incrementally from a fixed 128 KiB buffer.
+The complete partition remained below the independent 512 MiB partition limit.
+
+Version 0.1.3 exempts only streamed `Ignore` and `Zero` spans from the dependency-allocation limit.
+Compressed and raw chunks retain the 64 MiB expanded-size guard, and every chunk remains covered
+by checked sector arithmetic and the aggregate partition limit. A deterministic metadata-only
+regression accepts a streamed span one sector above 64 MiB without materializing it; the adjacent
+compressed-chunk regression proves that decoder allocations above the same boundary are still
+rejected. No authorized corpus bytes, names, or hashes are committed.
+
+The corrective working tree passed all repository gates: 22 Python tests, 20 Rust tests on Rust
+1.98.1 and 1.88.0, 90% Python line coverage, 80.03% native line coverage, Ruff, mypy, Bandit, both
+rustfmt checks, root/fuzz Clippy, fuzz builds, documentation, version, license, Cargo audit, and both
+pip-audit forms. Five bounded AddressSanitizer campaigns completed without a crash, timeout,
+sanitizer report, or artifact; their statistics are retained in [`FUZZING.md`](FUZZING.md). An
+isolated install of the production-style wheel parsed both the committed FAT fixture and the
+authorized acceptance image, reporting two and seven partitions respectively.
+
+The local static-liblzma artifacts passed auditwheel and Twine. The macOS ABI3 wheel is 825,684
+bytes with SHA-256 `f23103bc5eabba23bb0319d2ac9a80f2bd5a20ce0ae976276328cad8b5f68422`; the
+3,120,635-byte source distribution has SHA-256
+`c82125c75c862ab94a7c1a6daadd897ce118b9857028195d94cd122ff9d766d3`. Hosted and published
+artifact evidence is recorded after the tag-gated workflow completes.
+
 ## Deferred and non-blocking follow-up
 
 None of these items is an active security blocker under the assessed threat model:

@@ -1050,7 +1050,9 @@ fn decode_blkx_table(bytes: &[u8]) -> Result<BlkxTable> {
             .sector_count
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| anyhow!("blkx chunk {index} expanded size overflow"))?;
-        if chunk_expanded > MAX_EXPANDED_CHUNK_BYTES {
+        if !matches!(chunk.ty(), Some(ChunkType::Zero | ChunkType::Ignore))
+            && chunk_expanded > MAX_EXPANDED_CHUNK_BYTES
+        {
             bail!(
                 "blkx chunk {index} expanded size {chunk_expanded} exceeds limit {MAX_EXPANDED_CHUNK_BYTES}"
             );
@@ -3739,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn blkx_rejects_gaps_and_large_dependency_allocations() {
+    fn blkx_rejects_gaps_and_large_decoder_allocations() {
         let mut gapped = BlkxTable {
             sector_count: 2,
             ..BlkxTable::default()
@@ -3758,12 +3760,29 @@ mod tests {
             ..BlkxTable::default()
         };
         oversized.chunks = vec![
-            BlkxChunk::new(ChunkType::Zero, 0, oversized_sectors, 0, 0),
-            BlkxChunk::term(oversized_sectors, 0),
+            BlkxChunk::new(ChunkType::Zlib, 0, oversized_sectors, 0, 1),
+            BlkxChunk::term(oversized_sectors, 1),
         ];
         let error = decode_blkx_table(&encode_blkx(&oversized))
             .expect_err("oversized dependency allocation must be rejected");
         assert!(error.to_string().contains("expanded size"));
+    }
+
+    #[test]
+    fn blkx_accepts_large_streamed_ignore_spans() {
+        let streamed_sectors = MAX_EXPANDED_CHUNK_BYTES / SECTOR_SIZE + 1;
+        let mut table = BlkxTable {
+            sector_count: streamed_sectors,
+            ..BlkxTable::default()
+        };
+        table.chunks = vec![
+            BlkxChunk::new(ChunkType::Ignore, 0, streamed_sectors, 0, 0),
+            BlkxChunk::term(streamed_sectors, 0),
+        ];
+
+        let decoded = decode_blkx_table(&encode_blkx(&table))
+            .expect("streamed ignore spans do not require a dependency allocation");
+        assert_eq!(decoded.sector_count, streamed_sectors);
     }
 
     #[test]
