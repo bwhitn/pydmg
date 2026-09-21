@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Optional release version (e.g. 0.1.0) to validate during manual runs"
+        description: "Optional release version (e.g. 0.1.2) to validate during manual runs"
         required: false
         default: ""
 
@@ -58,6 +58,7 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: "1.98.1"
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install verification tools
@@ -126,12 +127,15 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
         with:
-          toolchain: nightly
+          toolchain: "1.98.1"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: nightly-2026-09-01
           components: rust-src
 
       - name: Install fuzz tooling
         run: |
-          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +nightly-2026-09-01 install cargo-fuzz --version 0.13.2 --locked
           python -m pip install -e ".[test]"
 
       - name: Prepare structure-aware corpus
@@ -140,7 +144,7 @@ jobs:
       - name: Run release smoke campaign
         run: |
           fuzz_log="${RUNNER_TEMP}/release-fuzz-${{ matrix.target }}.log"
-          if cargo fuzz run --sanitizer address --build-std "${{ matrix.target }}" \
+          if cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std "${{ matrix.target }}" \
               "${{ runner.temp }}/corpus/${{ matrix.target }}" -- \
               -max_total_time=30 -max_len=4194304 -timeout=10 -rss_limit_mb=3072 \
               -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1 \
@@ -152,9 +156,51 @@ jobs:
             exit 1
           fi
 
+  performance:
+    name: Release Performance Evidence
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    env:
+      LZMA_API_STATIC: "1"
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.98.1"
+
+      - name: Build production and instrumented release artifacts
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install maturin==1.14.1
+          .venv/bin/maturin build --release --locked --auditwheel check --out "${RUNNER_TEMP}/performance-dist"
+          .venv/bin/maturin develop --release --locked --features benchmarking
+
+      - name: Measure immutable release revision
+        shell: bash
+        run: |
+          wheel="$(find "${RUNNER_TEMP}/performance-dist" -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "${wheel}"
+          .venv/bin/python scripts/benchmark.py \
+            --label "release-${GITHUB_SHA}" \
+            --samples 9 \
+            --warmups 2 \
+            --wheel "${wheel}" \
+            --publish \
+            --output "${RUNNER_TEMP}/pydmg-release-performance.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-performance-${{ github.sha }}
+          path: ${{ runner.temp }}/pydmg-release-performance.json
+
   build-wheels:
     name: Wheels (${{ matrix.target }})
-    needs: [quality, fuzz-smoke]
+    needs: [quality, fuzz-smoke, performance]
     runs-on: ${{ matrix.os }}
     env:
       LZMA_API_STATIC: "1"
@@ -179,6 +225,8 @@ jobs:
       - uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
         if: startsWith(matrix.target, 'x86_64-unknown-linux')
         with:
+          maturin-version: v1.14.1
+          rust-toolchain: "1.98.1"
           target: ${{ matrix.target }}
           manylinux: auto
           args: --release --locked --auditwheel check --out dist
@@ -191,6 +239,8 @@ jobs:
           CFLAGS_aarch64_unknown_linux_gnu: -std=gnu99
           "CFLAGS_aarch64-unknown-linux-gnu": -std=gnu99
         with:
+          maturin-version: v1.14.1
+          rust-toolchain: "1.98.1"
           target: ${{ matrix.target }}
           manylinux: auto
           args: --release --locked --auditwheel check --out dist
@@ -199,6 +249,8 @@ jobs:
       - uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
         if: ${{ !startsWith(matrix.target, 'x86_64-unknown-linux') && !startsWith(matrix.target, 'aarch64-unknown-linux') }}
         with:
+          maturin-version: v1.14.1
+          rust-toolchain: "1.98.1"
           target: ${{ matrix.target }}
           args: --release --locked --compatibility pypi --auditwheel check --out dist
           sccache: "true"
@@ -210,7 +262,7 @@ jobs:
 
   build-sdist:
     name: Source Distribution
-    needs: [quality, fuzz-smoke]
+    needs: [quality, fuzz-smoke, performance]
     runs-on: ubuntu-latest
 
     steps:
@@ -218,6 +270,8 @@ jobs:
 
       - uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
         with:
+          maturin-version: v1.14.1
+          rust-toolchain: "1.98.1"
           command: sdist
           args: --out dist
 

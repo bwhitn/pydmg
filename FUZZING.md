@@ -23,8 +23,8 @@ rejection boundaries.
 ## Prerequisites
 
 ```bash
-rustup toolchain install nightly --profile minimal --component rust-src
-cargo install cargo-fuzz --version 0.13.2 --locked
+rustup toolchain install nightly-2026-09-01 --profile minimal --component rust-src
+cargo +nightly-2026-09-01 install cargo-fuzz --version 0.13.2 --locked
 python -m pip install -e ".[dev]"
 ```
 
@@ -69,27 +69,27 @@ run; an uncontained panic still reaches libFuzzer's outer catch and fails the pr
 artifact and a post-preflight 68-second ASan campaign now complete without a new failure.
 
 ```bash
-cargo +nightly fuzz run --sanitizer address --build-std dmg_parse \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std dmg_parse \
   "${PYDMG_FUZZ_CORPUS}/dmg_parse" -- \
   -max_total_time=300 -max_len=4194304 -timeout=10 -rss_limit_mb=3072 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std blkx \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std blkx \
   "${PYDMG_FUZZ_CORPUS}/blkx" -- \
   -max_total_time=300 -max_len=1048576 -timeout=5 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std chunk \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std chunk \
   "${PYDMG_FUZZ_CORPUS}/chunk" -- \
   -max_total_time=300 -max_len=1048576 -timeout=5 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std gpt \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std gpt \
   "${PYDMG_FUZZ_CORPUS}/gpt" -- \
   -max_total_time=300 -max_len=4194304 -timeout=10 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std image \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std image \
   "${PYDMG_FUZZ_CORPUS}/image" -- \
   -max_total_time=300 -max_len=4194304 -timeout=30 -rss_limit_mb=4096 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
@@ -110,8 +110,8 @@ does not print a crash input or Base64 reproducer into the public log.
 location.
 
 ```bash
-cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<artifact>
-cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/<artifact>
+cargo +nightly-2026-09-01 fuzz run <target> fuzz/artifacts/<target>/<artifact>
+cargo +nightly-2026-09-01 fuzz tmin <target> fuzz/artifacts/<target>/<artifact>
 ```
 
 For each unique finding:
@@ -135,12 +135,27 @@ growth, and reach successful parser paths as well as rejection paths. Generate a
 after corpus minimization:
 
 ```bash
-cargo +nightly fuzz cmin <target> "${PYDMG_FUZZ_CORPUS}/<target>"
-cargo +nightly fuzz coverage <target> "${PYDMG_FUZZ_CORPUS}/<target>"
+cargo +nightly-2026-09-01 fuzz cmin <target> "${PYDMG_FUZZ_CORPUS}/<target>"
+cargo +nightly-2026-09-01 fuzz coverage <target> "${PYDMG_FUZZ_CORPUS}/<target>"
 ```
 
 The dated baseline and its limitations are recorded in [`AUDIT.md`](AUDIT.md). A bounded clean run
 means only that no finding occurred during that campaign; it is not a security guarantee.
+
+On 2026-09-21, after the Rust 1.98.1 streaming/on-demand partition changes, all five targets ran
+with cargo-fuzz 0.13.2, `nightly-2026-09-01`, AddressSanitizer, structure-aware seeds, and owner-only
+corpus/artifact directories:
+
+| Target | Budget | Executions | Coverage / features | Peak RSS | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dmg_parse` | 30 s | 15,698 | 1,619 / 3,978 | 528 MB | No finding |
+| `blkx` | 30 s | 457,781 | 240 / 483 | 438 MB | No finding |
+| `chunk` | 30 s | 195,607 | 954 / 2,287 | 391 MB | No finding |
+| `gpt` | 30 s | 444,612 | 695 / 1,626 | 603 MB | No finding |
+| `image` | 300 s | 3,327 | 5,661 / 12,561 | 1,059 MB | No finding |
+
+No crash artifact, timeout, or sanitizer report was produced. These are bounded single-host
+campaigns; the scheduled and release jobs remain the canonical recurring gates.
 
 ## Known instrumentation limits
 
@@ -151,11 +166,10 @@ means only that no finding occurred during that campaign; it is not a security g
 - The filesystem target is slower than pure in-memory targets and needs a longer per-input timeout.
 - Fuzzing one host architecture does not replace campaigns on other supported architectures and
   operating systems.
-- The workstation's normal `PATH` does not expose `rustup`, nightly, `cargo-fuzz`, or
-  `cargo-llvm-cov`. A previously created temporary nightly/cargo-fuzz toolchain under
-  `/private/tmp` was recoverable and supplied the exact-input, 68-second follow-up, and focused
-  post-boundary ASan runs. The latter completed 70,439 `gpt`, 17,096 `dmg_parse`, and 20 `image`
+- During the July review, a temporary nightly/cargo-fuzz toolchain under `/private/tmp` supplied the
+  exact-input, 68-second follow-up, and focused post-boundary ASan runs because the normal `PATH`
+  lacked those tools. The latter completed 70,439 `gpt`, 17,096 `dmg_parse`, and 20 `image`
   executions without a crash, timeout, or sanitizer finding. The whole-image seeds are expensive,
-  so that 35-second image run is only smoke evidence. The workstation still cannot reproduce native
-  coverage because `cargo-llvm-cov` is unavailable, but the pinned hosted job has passed with
-  80.75% native line coverage.
+  so that 35-second image run is only smoke evidence. As of 2026-09-21, rustup nightly,
+  `cargo-fuzz`, and `cargo-llvm-cov` are available locally. A fresh Rust 1.98.1 native run now
+  records 79.78% line coverage; the pinned hosted job's last recorded result remains 80.75%.

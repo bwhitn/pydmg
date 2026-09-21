@@ -2,6 +2,7 @@
 
 Assessment date: **2026-07-18**
 Remediation review: **2026-07-19**
+Performance/toolchain review: **2026-09-21**
 Code baseline: `de11c42b3950` on `master`, plus the remediation change set documented here
 Scope: Rust core, Python API, tests, fixtures, packaging, dependencies, documentation,
 CI/release workflows, fuzzing, and hostile-input behavior
@@ -41,11 +42,11 @@ structural parsing remain correctly documented as non-authenticating operations.
 
 The repository-owned lint, type, security-lint, test, documentation, range-validation,
 decompression, output-safety, CI, release, and fuzz-infrastructure findings have been remediated.
-The current local suite passes 21 Python integration/adversarial tests and 17 native Rust tests
-(16 cross-platform plus one Unix path-panic regression).
+The current local suite passes 22 Python integration/adversarial tests and 19 native Rust tests
+(18 cross-platform plus one Unix path-panic regression).
 Ruff, strict mypy, Bandit, rustfmt, and Clippy with warnings denied are green. Python line coverage
-remains 90% and now has a gate; hosted native coverage is 80.75% lines against a separate 70%
-workflow gate.
+remains 90% and now has a gate; fresh local and hosted Rust 1.98.1 runs both record 79.78% native
+lines against the separate 70% workflow gate.
 
 The 171 GB BLKX allocation is rejected before entering `apple-dmg`. The malformed APFS case is
 caught at this repository's dependency boundary and returned as `RuntimeError`, but `apfs 0.2.4`
@@ -64,18 +65,19 @@ deployments, but residual third-party resource behavior is deferred in this revi
 
 | Area | Current result |
 | --- | --- |
-| Python tests | 21 passed |
-| Native Rust tests | 17 passed on macOS; 16 cross-platform |
+| Python tests | 22 passed |
+| Native Rust tests | 19 passed on macOS; 18 cross-platform |
 | Python coverage | 90%; enforced at 90% in CI/release |
-| Native Rust coverage | Hosted result 80.75% lines; enforced at 70% in CI/release |
+| Native Rust coverage | Local and current hosted Rust 1.98.1 result 79.78% lines; 70% gate |
 | Python lint/type | Expanded Ruff rules, strict mypy, and consumer stub check pass |
 | Security lint | Bandit passes; three exact false positives have inline rationale |
 | Rust lint | rustfmt and Clippy `-D warnings` pass |
-| Fuzz harness | Five targets compile; four hosted PR ASan smoke jobs passed; whole-image fuzz runs on schedule/release |
+| Fuzz harness | All five local ASan campaigns pass; hosted smoke/scheduled gates retained |
 | Python dependency audit | No runtime dependencies or known vulnerability in the last completed run |
 | Rust dependency audit | PyO3 and quick-xml advisories resolved; no configured exceptions remain |
 | Documentation | README, API docstrings, security policy, audit, fuzz guide, and `AGENTS.md` updated |
-| Release readiness | Repository gates are present; resource risks are deferred and ADC is a compatibility limitation |
+| Performance | Dated nine-sample before/after evidence; clean-SHA CI/release artifact gates |
+| Release readiness | Rust 1.98.1/maturin are pinned; MSRV remains tested at 1.88; resource risks are deferred and ADC is a compatibility limitation |
 
 ## Security findings
 
@@ -164,8 +166,12 @@ The implementation now enforces fixed checked ceilings before local allocations:
 | Metadata candidates / rendered value | 10,000 / 4,096 characters |
 | Created DMG | 512 MiB |
 
-Zlib and bzip2 decode through a one-byte-over-limit reader; LZFSE receives a bounded declared-size
-buffer; zero/raw chunks and aggregate partition output are checked before allocation. Binary plist
+Zlib and bzip2 decode through a one-byte-over-limit reader directly into the destination; LZFSE
+reuses bounded compressed and declared-size buffers; zero/raw chunks and aggregate partition output
+are checked before allocation. Complete decodes must produce exactly the declared expanded size.
+FAT operations use a read-only seekable BLKX device with a one-chunk cache and decompress only the
+spans requested by `fatfs`, while the existing dependency read-byte and operation budgets remain
+outside that device. Binary plist
 object counts and collection reference lengths are preflighted, and all plist encodings pass
 through a bounded event stream before a `Value` is built. BLKX data
 chunks must be contiguous, cover the declared partition exactly, and expand to no more than 64 MiB
@@ -417,7 +423,7 @@ closed before output and is not itself a security vulnerability.
 
 - Status: **Resolved locally**
 
-There are now 17 native tests on the reviewed Unix host (16 cross-platform) and 21 Python tests
+There are now 19 native tests on the reviewed Unix host (18 cross-platform) and 22 Python tests
 covering BLKX count/truncation/layout, range overflow, zlib/bzip2/LZFSE decoding, expansion limits,
 streamed/binary plist preflight, dependency panic containment, FAT read budgets, hostile HFS/APFS
 block sizes, GPT assertion/count/range/CRC preflight, filesystem-partition budgets, checksum ranges,
@@ -432,6 +438,10 @@ Rust reports and enforce 90% Python / 70% native line floors; CI uploads both. T
 was 66/73 statements plus branch accounting (90%). Hosted run
 [`29674156138`](https://github.com/bwhitn/pydmg/actions/runs/29674156138) at commit `1de7a87`
 confirmed 90% Python coverage and 80.75% native lines, 60.22% functions, and 79.03% regions.
+A fresh local run with the pinned Rust 1.98.1 compiler reports 79.78% native lines, 59.19%
+functions, and 77.82% regions. The optimized candidate's hosted run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) reproduced exactly those
+native totals and 90% Python coverage; all recorded native results remain above the 70% gate.
 
 ### QA-008 — Fuzzing was not continuous
 
@@ -446,6 +456,16 @@ SEC-011. Hosted run
 [`29674156143`](https://github.com/bwhitn/pydmg/actions/runs/29674156143) passed the bounded `blkx`,
 `chunk`, `dmg_parse`, and `gpt` ASan jobs; the slower whole-image job was skipped on the PR as
 designed and remains a scheduled and release gate.
+
+The optimized candidate's hosted run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) also passed the bounded
+`blkx`, `chunk`, `dmg_parse`, and `gpt` ASan jobs with the pinned dated nightly. Whole-image fuzz was
+again skipped by the documented PR policy and remains mandatory in scheduled and release runs.
+
+The 2026-09-21 post-optimization local campaigns then passed all five targets with
+`nightly-2026-09-01`, cargo-fuzz 0.13.2, and AddressSanitizer: 15,698 `dmg_parse`, 457,781 `blkx`,
+195,607 `chunk`, 444,612 `gpt`, and 3,327 whole-image executions. The image target completed its
+full 300-second budget; no target produced a crash artifact, timeout, or sanitizer report.
 
 ### QA-009 — API and safety documentation was incomplete
 
@@ -481,8 +501,9 @@ gates. Tool versions that materially affect results are pinned in workflows.
 
 - Status: **Resolved locally**
 
-CI checks and tests the locked all-feature graph with Rust 1.88.0 separately from moving stable.
-The current lock metadata declares no crate requiring a newer Rust version.
+CI checks and tests the locked all-feature graph with Rust 1.88.0 separately from the reproducible
+Rust 1.98.1 primary toolchain. The current lock metadata declares no crate requiring a newer Rust
+version.
 
 ### QA-014 — A local macOS wheel linked Homebrew `liblzma` dynamically
 
@@ -541,6 +562,55 @@ so future changes to the fuzz gate trigger the four bounded PR smoke targets. Re
 pins are validated with a non-tag manual release run; the PyPI job remains restricted to version
 tags.
 
+### QA-019 — Primary builds and performance claims were not reproducible
+
+- Status: **Resolved and observed in hosted CI**
+
+`rust-toolchain.toml`, every primary CI job, release quality, and every wheel/sdist build now select
+Rust 1.98.1 explicitly; the build backend and release action select maturin 1.14.1. The independent
+Rust 1.88.0 MSRV job remains intact. `scripts/verify_versions.py` rejects primary-toolchain or MSRV
+drift.
+
+`scripts/benchmark.py` runs release scenarios in fresh worker processes and records wall/CPU time,
+peak RSS, process block I/O, logical decoded/written bytes, Rust allocation/reallocation counts and
+bytes, repository-owned staging copies, fixture hashes, startup time, and wheel/native sizes. The
+dated two-warmup/nine-sample before/after evidence and profile decisions are in
+[`PERFORMANCE.md`](PERFORMANCE.md). CI retains a five-sample SHA-named report; release retains nine
+samples and blocks wheel builds until it succeeds. `--publish` refuses a dirty checkout, preventing
+mutable working-tree measurements from being presented as published evidence.
+
+Hosted PR run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed the performance gate
+from clean synthetic merge commit `5f284af72617cd2a489f5a5ecaaa63495df46b2f`. Its retained
+five-sample report names that revision as both source and checkout, records `published: true`, and
+has SHA-256 `d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405ac063c3`.
+
+### QA-020 — Implicit rustup components conflicted on some hosted images
+
+- Severity: **Low operational compatibility**
+- Status: **Resolved and observed in hosted CI**
+
+The first Rust 1.98.1 pull-request run
+[`35607307980`](https://github.com/bwhitn/pydmg/actions/runs/35607307980) passed lint, native,
+coverage, security, MSRV, and most Python jobs, but three Python matrix entries and the performance
+job stopped while rustup tried to add `rustfmt` and `clippy` implicitly. Those runner images already
+contained the component binaries without matching component metadata, so rustup reported a
+`bin/cargo-fmt` conflict. No project compilation or test failed.
+
+`rust-toolchain.toml` now pins only the exact compiler and minimal profile; workflow jobs that need
+rustfmt, Clippy, or LLVM tools install those components explicitly in the toolchain setup action.
+MSRV commands use an explicit `+1.88.0` selector so the repository toolchain override cannot mask
+the compatibility lane. Fuzz jobs install both the pinned stable compiler and
+`nightly-2026-09-01` with `rust-src`, and invoke cargo-fuzz through that dated nightly, making each
+toolchain role explicit.
+
+The replacement CI run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed every Linux, macOS,
+and Windows matrix entry plus performance, coverage, security, lint, native, and explicit Rust 1.88
+jobs. The paired fuzz run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) passed all four PR ASan
+targets. This confirms that the explicit toolchain setup resolves the hosted-image collision.
+
 ## Fuzzing evidence
 
 Initial campaigns used `cargo-fuzz 0.13.2`, nightly Rust, sanitizer-instrumented standard library,
@@ -578,6 +648,20 @@ seconds; it is useful post-change smoke evidence, not a substitute for the longe
 Failure artifacts were directed to a newly created mode `0700` temporary directory; no repository
 artifact was produced.
 
+After the Rust 1.98.1 partition streaming and on-demand FAT changes, fresh local ASan campaigns on
+2026-09-21 produced:
+
+| Target | Budget | Executions | Coverage / features | Peak RSS | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dmg_parse` | 30 s | 15,698 | 1,619 / 3,978 | 528 MB | No finding |
+| `blkx` | 30 s | 457,781 | 240 / 483 | 438 MB | No finding |
+| `chunk` | 30 s | 195,607 | 954 / 2,287 | 391 MB | No finding |
+| `gpt` | 30 s | 444,612 | 695 / 1,626 | 603 MB | No finding |
+| `image` | 300 s | 3,327 | 5,661 / 12,561 | 1,059 MB | No finding |
+
+These used cargo-fuzz 0.13.2, `nightly-2026-09-01`, owner-only corpus/artifact directories, and the
+documented input/time/RSS ceilings. No crash artifact, timeout, or sanitizer report was produced.
+
 ## External issues and environment boundaries
 
 The root causes or host state below were not modified outside this repository. Where possible, the
@@ -612,11 +696,12 @@ memory availability are retained for completeness but deferred under the current
    with a minimized crash input mode `0644`. That is readable by other local users on a shared
    workstation. It was not changed because it is outside the repository; the operator should move
    sensitive artifacts to owner-only storage and use `umask 077` for future campaigns.
-8. The normal workstation `PATH` has stable Cargo but not `rustup`, nightly, `cargo-fuzz`, or
-   `cargo-llvm-cov`. A prior temporary nightly/cargo-fuzz toolchain was recoverable under
-   `/private/tmp` and was used for the follow-up ASan and focused boundary runs. Post-remediation
-   native coverage remains unavailable locally because `cargo-llvm-cov` is absent; pinned CI owns
-   that assurance check and has recorded an 80.75% hosted line result.
+8. During the July review the normal workstation `PATH` exposed stable Cargo but not `rustup`,
+   nightly, `cargo-fuzz`, or `cargo-llvm-cov`, so a temporary toolchain under `/private/tmp` supplied
+   follow-up ASan evidence and hosted CI supplied the 80.75% native line result. As of the 2026-09-21
+   review, rustup-managed Rust 1.98.1/1.88.0/nightly plus `cargo-fuzz` and `cargo-llvm-cov` are
+   available locally. Local and current hosted Rust 1.98.1 native coverage are both 79.78%; the
+   optimized committed candidate has also passed the complete hosted cross-platform PR gate.
 9. No upstream issue, pull request, or external message was created as part of this repository-only
    work. Upstream coordination is therefore still outstanding.
 
@@ -630,9 +715,9 @@ is outside the narrower single-output workflow.
 
 Two previously reported local/environment items are now resolved: the unnecessary
 `dpp -> xara -> quick-xml 0.37.5` path was removed from `Cargo.lock`, and the ignored local `.venv`
-was upgraded from vulnerable `pip 25.0.1` to `pip 26.1.2`. A full active-environment pip audit now
-reports no known vulnerabilities. CI/release continue to upgrade pip before installing tools and
-audit both the project and complete tool environment.
+was upgraded to `pip 26.2` after the active-environment audit identified PYSEC-2026-3721 in 26.1.2.
+The repeated full audit reports no known vulnerabilities. CI/release continue to upgrade pip before
+installing tools and audit both the project and complete tool environment.
 
 ## Completed local verification
 
@@ -642,34 +727,48 @@ The remediation working tree has passed:
 ruff check .
 mypy
 bandit -q -r python scripts
-pytest -q                                      # 21 passed
+pytest -q                                      # 22 passed
 coverage run -m pytest -q && coverage report  # 90%
+cargo llvm-cov report --fail-under-lines 70   # 79.78% lines on Rust 1.98.1
 cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
-cargo test --locked --all-targets --all-features  # 17 passed on macOS
+cargo test --locked --all-targets --all-features  # 19 passed on macOS
 cargo check --manifest-path fuzz/Cargo.toml --bins
+rustup run 1.88.0 cargo test --locked --all-targets --all-features  # 19 passed
 python scripts/check_audit_exceptions.py           # 0 exceptions
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
-python scripts/verify_versions.py --expected 0.1.0
+python scripts/verify_versions.py --expected 0.1.2
 cargo audit                                    # 107 dependencies; no findings
 python -m pip_audit .                         # no known vulnerabilities
 python -m pip_audit                           # no known vulnerabilities
-maturin build ... --locked --auditwheel check
+maturin build ... --locked --compatibility pypi --auditwheel check  # static liblzma
 maturin sdist ... && twine check ...          # wheel and sdist passed
+cargo-fuzz ASan: four 30-second parser campaigns and one 300-second image campaign
 ```
 
-The Cargo audit used pinned `cargo-audit 0.22.2`, refreshed the RustSec database and crates.io
-index, scanned 107 locked dependencies, and returned success with no ignores. The other host
-limitations above are reported rather than bypassed.
+The local Cargo audit used `cargo-audit 0.22.1`, refreshed the RustSec database and crates.io index,
+scanned 107 locked dependencies, and returned success with no ignores; workflows pin 0.22.2. The
+other host limitations above are reported rather than bypassed.
 
-The replacement hosted PR run passed the Python/native coverage job, dependency-security job,
-lint/type/documentation job, native and Rust 1.88 jobs, and the Python 3.9–3.13 Linux, macOS, and
-Windows matrix. All four PR fuzz-smoke jobs also passed; whole-image fuzz was skipped by its
-documented PR policy.
+The final clean-commit 0.1.2 packaging pass produced an 825,674-byte CPython 3.9+ ABI3 macOS wheel
+(`ae73953919af65e090793c396f8d8be2ea2917f1da7dad9f8880aca07a423bc9`) and a 3,119,102-byte
+source distribution (`28753317ae6187a6e788f1235ac0e88cf0531d38d006ad3b9e0c604aed57da36`).
+Auditwheel and Twine accepted both artifacts, an isolated install parsed the committed FAT fixture,
+and the wheel's native dependency list contained only system libraries because liblzma was linked
+statically.
+
+The replacement hosted PR CI run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed the Python/native
+coverage job, dependency-security job, clean-SHA performance job, lint/type/documentation job,
+native and Rust 1.88 jobs, and the Python 3.9–3.13 Linux, macOS, and Windows matrix. Its coverage
+artifact records 90% Python and 79.78% native lines. Its published performance artifact has SHA-256
+`d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405ac063c3`. Paired fuzz run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) passed all four PR
+fuzz-smoke jobs; whole-image fuzz was skipped by its documented PR policy.
 
 ## Deferred and non-blocking follow-up
 

@@ -42,7 +42,7 @@ pip install pydmg
 Requirements:
 
 - Python 3.9+
-- Rust toolchain (stable)
+- Rust 1.98.1 for reproducible repository builds (the crate's tested MSRV remains 1.88)
 - C/C++ compiler toolchain
 
 Platform notes for source builds:
@@ -327,9 +327,21 @@ The test suite covers:
 - FAT and direct-output symlink defenses and atomic failure behavior
 - FAT/HFS+/APFS dependency read budgets and panic containment
 
-The current suite contains 21 Python tests and 16 cross-platform native Rust tests, plus one Unix
+The current suite contains 22 Python tests and 18 cross-platform native Rust tests, plus one Unix
 path-panic regression. CI enforces 90% Python line coverage and 70% native Rust line coverage as
 separate measurements.
+
+## Performance
+
+FAT filesystems are served through a bounded seekable BLKX reader, so directory listing and file
+extraction decompress only requested chunks instead of materializing an entire partition. Direct
+partition reads and atomic extraction stream into their final sink, with reusable LZFSE buffers and
+no per-chunk staging copy.
+
+The release-mode benchmark method, raw samples, profiles, artifact-size tradeoffs, and dated
+before/after results are in [`PERFORMANCE.md`](PERFORMANCE.md). CI records five-sample evidence for
+each immutable revision, and the tag-gated release workflow records nine samples before building
+distribution artifacts.
 
 ## Security, audit, and fuzzing
 
@@ -366,7 +378,7 @@ build succeeds.
 This repo includes workflows for:
 
 - CI: Python 3.9–3.13 and Rust tests, lint, strict typing, Bandit, dependency audits, MSRV, and
-  separate Python/native coverage gates
+  separate Python/native coverage and release-performance evidence gates
 - Fuzz: required PR smoke and scheduled AddressSanitizer campaigns; sensitive failures remain on
   the runner for private reproduction rather than being uploaded from the public repository
 - Release: repeat quality/security/coverage/fuzz gates, build wheels and source distribution, then
@@ -379,7 +391,7 @@ Release workflow targets:
 - Windows: `x86_64`
 - Plus `sdist` for architecture-independent source release
 
-For publishing, configure PyPI trusted publishing for this repository and push a tag like `v0.1.0`.
+For publishing, configure PyPI trusted publishing for this repository and push a tag like `v0.1.2`.
 
 Detailed release steps are documented in [`RELEASE.md`](RELEASE.md).
 

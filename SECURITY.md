@@ -61,7 +61,9 @@ Repository-owned demonstrated issues have local guards and regressions. The vuln
 dependency path has been removed and no advisory exceptions remain. Plist budgets now run while
 events are streamed, dangerous binary-plist collection lengths are rejected before allocation,
 GPT headers are preflighted before the dependency assertion, and FAT reads have byte/operation
-budgets plus panic containment. No demonstrated repository-owned vulnerability remains active
+budgets plus panic containment. FAT access now decompresses only requested bounded BLKX chunks;
+complete partition reads stream to their final sink and must match the declared expanded size. No
+demonstrated repository-owned vulnerability remains active
 under the assessed threat model. The APFS parser panic remains external, HFS/APFS B-tree traversal
 budgets remain upstream gaps, and fixed in-process ceilings cannot bound all third-party parser
 CPU work; their residual CPU/memory availability impact is deferred in this assessment.
@@ -153,6 +155,7 @@ cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
 cargo test --locked --all-targets --all-features
+cargo check --manifest-path fuzz/Cargo.toml --bins
 cargo audit
 python -m pip_audit .
 python -m pip_audit
@@ -160,6 +163,7 @@ python scripts/check_audit_exceptions.py
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+python scripts/verify_versions.py
 ```
 
 Run the bounded fuzz smoke campaigns described in [`FUZZING.md`](FUZZING.md), and run longer
