@@ -391,7 +391,7 @@ Release workflow targets:
 - Windows: `x86_64`
 - Plus `sdist` for architecture-independent source release
 
-For publishing, configure PyPI trusted publishing for this repository and push a tag like `v0.1.2`.
+For publishing, configure PyPI trusted publishing for this repository and push a tag like `v0.1.3`.
 
 Detailed release steps are documented in [`RELEASE.md`](RELEASE.md).
 

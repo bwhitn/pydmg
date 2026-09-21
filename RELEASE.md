@@ -17,7 +17,7 @@ Repository builds use the exact Rust 1.98.1 toolchain in `rust-toolchain.toml`; 
 
 ## Per-release steps
 
-1. Choose the release version, for example `0.1.2`.
+1. Choose the release version, for example `0.1.3`.
 2. Ensure versions match in both files:
    - `pyproject.toml`: `project.version`
    - `Cargo.toml`: `package.version`
@@ -25,7 +25,7 @@ Repository builds use the exact Rust 1.98.1 toolchain in `rust-toolchain.toml`; 
 
 ```bash
 . .venv/bin/activate
-python scripts/verify_versions.py --expected 0.1.2
+python scripts/verify_versions.py --expected 0.1.3
 python scripts/check_audit_exceptions.py
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
@@ -67,8 +67,8 @@ twine check dist/*
 6. Create and push the release tag:
 
 ```bash
-git tag -a v0.1.2 -m "Release v0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.3 -m "Release v0.1.3"
+git push origin v0.1.3
 ```
 
 7. Watch the `Release` workflow in GitHub Actions.
@@ -77,7 +77,7 @@ git push origin v0.1.2
 8. Confirm artifacts appear on PyPI and install test passes:
 
 ```bash
-pip install pydmg==0.1.2
+pip install pydmg==0.1.3
 python -c "import pydmg; print(pydmg.__version__)"
 ```
 

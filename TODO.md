@@ -2,8 +2,8 @@
 
 ## Current
 
-- [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **Implementation, local validation,
-  clean-SHA publication evidence, and the hosted PR gates are complete; merge, release, and ALES integration remain**:
+- [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **Version 0.1.2 is published, and
+  the locally verified 0.1.3 compatibility correction, hosted patch gates, and ALES integration remain**:
   - [x] Capture release-mode baselines for generated UDIF/plist/BLKX, compressed-chunk, partition, filesystem, and
     extraction fixtures. Record wall time, CPU, peak memory, allocations/copies, decompressed and written bytes,
     disk I/O, startup/import time, and wheel/native size. `PERFORMANCE.md` and `benchmarks/results/` contain the local
@@ -28,8 +28,9 @@
       `ea8039de944193311e00d0d9dea0b2530d968b5e` joined both histories without rewriting the published branch or changing
       any file, so no benchmark regeneration was needed for the reconciliation itself.
     - [x] Reconcile repository metadata currently declaring `0.1.0` with the `pydmg==0.1.1` release already consumed
-      by ALES. Version 0.1.2 is now consistent in `Cargo.toml`, `pyproject.toml`, `Cargo.lock`, version verification,
-      release documentation, and tag expectations; the native stub has no literal package-version field to update.
+      by ALES. Version 0.1.2 was reconciled for the first release, and the 0.1.3 corrective version is now consistent
+      in `Cargo.toml`, `pyproject.toml`, `Cargo.lock`, version verification, release documentation, and tag
+      expectations; the native stub has no literal package-version field to update.
   - [x] Prove that the final diff preserves checked hostile ranges, decompression/resource limits, panic containment,
     exact decoded-length checks, atomic extraction, symlink-safe paths, public JSON meanings, ABI3 behavior, and every
     open/closed finding in `AUDIT.md`, `SECURITY.md`, and `FUZZING.md`. Add deterministic regressions for any behavior
@@ -50,15 +51,22 @@
     clean worktree, retains a 274.9x FAT-listing speedup and 90.7% FAT-extraction reduction, and keeps unchanged APFS
     timings inside the baseline ranges; report SHA-256 is
     `3fc99a17452b874b78a4b9d78e6d888fd1fe40de0775c0cc4cf8ddd81be203c5`.
-  - [ ] Commit and push the reviewed candidate, then require the complete hosted cross-platform, Rust 1.88 MSRV,
-    coverage, audit, sanitizer/fuzz, documentation, wheel, and tag-gated release workflows to pass. Fix a failing gate
-    rather than weakening validation or editing retained audit history. The owner restored $20 of Actions capacity on
-    2026-09-21; complete every locally runnable gate before dispatching the necessary hosted matrices and avoid
-    redundant reruns that consume the limited budget. Candidate commits are pushed in PR
+  - [ ] Commit and push the reviewed corrective candidate, then require the complete hosted cross-platform, Rust 1.88
+    MSRV, coverage, audit, sanitizer/fuzz, documentation, wheel, and tag-gated release workflows to pass. Fix a failing
+    gate rather than weakening validation or editing retained audit history. The owner restored $20 of Actions
+    capacity on 2026-09-21; complete every locally runnable gate before dispatching the necessary hosted matrices and
+    avoid redundant reruns that consume the limited budget. Candidate commits are pushed in PR
     [`#3`](https://github.com/bwhitn/pydmg/pull/3); corrected CI run
     [`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) and fuzz run
-    [`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) pass. Merge and the tag-gated release
-    workflow remain.
-  - [ ] Publish the new immutable package release only after those gates pass. Update ALES from `pydmg==0.1.1`, refresh
+    [`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) pass. PR #3 was merged as
+    `d5808ff5e928819e2471c57175fa2323eb35f535`, and tagged release run
+    [`35611077830`](https://github.com/bwhitn/pydmg/actions/runs/35611077830) published 0.1.2 successfully. The 0.1.3
+    correction now passes every local gate, including all five ASan targets, but its hosted PR and release gates
+    remain.
+  - [ ] Publish the corrective immutable package release only after those gates pass. Version 0.1.2 is live on PyPI,
+    but authorized ALES acceptance exposed a valid 82,345,984-byte streamed `Ignore` span that its 64 MiB
+    dependency-allocation preflight rejected. The narrow 0.1.3 correction preserves the limit for decoder-backed
+    chunks, passes deterministic and authorized-image regression checks, and awaits hosted release evidence. Update
+    ALES from `pydmg==0.1.1`, refresh
     `poetry.lock`, and pass DMG analyzer, extraction/lineage, output/ObjectRules, image, SBOM/license, runtime-pruning,
     and authorized-corpus performance acceptance.
