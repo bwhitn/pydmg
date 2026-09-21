@@ -68,6 +68,15 @@ listings, the 20.9 MiB APFS partition payload, every extracted FAT fixture path/
 APFS `Info.plist` payload. Baseline and 0.1.2 candidate output were byte-for-byte identical
 (SHA-256 `dbbf2bfc1d08ac4989ed6138273189ba08e15b07e70172610693d94619c0fd25`).
 
+After committing the code candidate, a second nine-sample run used the final static-liblzma wheel
+from a clean worktree. Its report records both `source_revision` and `checked_out_revision` as
+`27edd356536837c44ed9d309eb34c17355cbbd04`, with `published: true`; the report SHA-256 is
+`3fc99a17452b874b78a4b9d78e6d888fd1fe40de0775c0cc4cf8ddd81be203c5`. Median FAT listing was
+1.504 ms (274.9x faster than baseline) and FAT extraction was 41.956 ms (-90.7%). APFS listing and
+extraction were 302.267 ms and 321.394 ms, respectively, both inside the baseline ranges. This
+confirms the material effects and the absence of a material regression in the unchanged APFS path
+using the exact clean candidate source.
+
 The production macOS wheel grew from 775,910 to 785,256 bytes (+1.20%); its uncompressed native
 extension grew from 1,814,344 to 1,975,224 bytes (+8.87%). This is the measured size cost of the
 bounded seekable partition reader and streaming decoder paths. The opt-in allocator instrumentation

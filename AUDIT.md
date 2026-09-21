@@ -715,9 +715,9 @@ The local Cargo audit used `cargo-audit 0.22.1`, refreshed the RustSec database 
 scanned 107 locked dependencies, and returned success with no ignores; workflows pin 0.22.2. The
 other host limitations above are reported rather than bypassed.
 
-The final local 0.1.2 packaging pass produced an 825,674-byte CPython 3.9+ ABI3 macOS wheel
-(`1faef3890909d60305638da7f403062f0b88eb2bb6f0633034aeedf8e4e02111`) and a 3,118,145-byte
-source distribution (`ca3f672096f588743a5931de2aa56dcbf84c9047685f49f66ec3162872e2aa25`).
+The final clean-commit 0.1.2 packaging pass produced an 825,674-byte CPython 3.9+ ABI3 macOS wheel
+(`ae73953919af65e090793c396f8d8be2ea2917f1da7dad9f8880aca07a423bc9`) and a 3,119,102-byte
+source distribution (`28753317ae6187a6e788f1235ac0e88cf0531d38d006ad3b9e0c604aed57da36`).
 Auditwheel and Twine accepted both artifacts, an isolated install parsed the committed FAT fixture,
 and the wheel's native dependency list contained only system libraries because liblzma was linked
 statically.

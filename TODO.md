@@ -3,8 +3,8 @@
 ## Current
 
 - [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **All locally executable
-  implementation and validation are complete; clean-SHA publication, hosted gates, release, and ALES integration
-  remain**:
+  implementation, validation, and clean-SHA publication evidence are complete; hosted gates, release, and ALES
+  integration remain**:
   - [x] Capture release-mode baselines for generated UDIF/plist/BLKX, compressed-chunk, partition, filesystem, and
     extraction fixtures. Record wall time, CPU, peak memory, allocations/copies, decompressed and written bytes,
     disk I/O, startup/import time, and wheel/native size. `PERFORMANCE.md` and `benchmarks/results/` contain the local
@@ -43,12 +43,14 @@
     version verification. Also require at least 90% Python and 70% native line coverage plus available cargo-audit and
     both pip-audit forms. All passed locally on 2026-09-21: 22 Python tests, 19 Rust tests on Rust 1.98.1 and 1.88.0,
     90% Python coverage, 79.78% native line coverage, five ASan fuzz campaigns, and no Cargo/pip audit findings.
-  - [ ] Rebuild production ABI3 wheel/sdist artifacts and rerun `scripts/benchmark.py --publish` from a clean commit so
+  - [x] Rebuild production ABI3 wheel/sdist artifacts and rerun `scripts/benchmark.py --publish` from a clean commit so
     the optimized report names the exact candidate SHA. Confirm the large FAT speed/RSS/allocation improvements,
     unchanged logical output, bounded cancellation, and no material regression in the unchanged APFS paths. Final
-    static-liblzma 0.1.2 wheel/sdist artifacts pass auditwheel, Twine, and an isolated install smoke test; the local
-    nine-sample benchmark and semantic differential pass, but the publication guard correctly refuses the uncommitted
-    tree, so a clean candidate commit is still required.
+    static-liblzma 0.1.2 wheel/sdist artifacts pass auditwheel, Twine, and an isolated install smoke test. The clean
+    nine-sample report names candidate `27edd356536837c44ed9d309eb34c17355cbbd04`, records `published: true` and a
+    clean worktree, retains a 274.9x FAT-listing speedup and 90.7% FAT-extraction reduction, and keeps unchanged APFS
+    timings inside the baseline ranges; report SHA-256 is
+    `3fc99a17452b874b78a4b9d78e6d888fd1fe40de0775c0cc4cf8ddd81be203c5`.
   - [ ] Commit and push the reviewed candidate, then require the complete hosted cross-platform, Rust 1.88 MSRV,
     coverage, audit, sanitizer/fuzz, documentation, wheel, and tag-gated release workflows to pass. Fix a failing gate
     rather than weakening validation or editing retained audit history. The owner restored $20 of Actions capacity on
