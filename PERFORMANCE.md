@@ -86,6 +86,28 @@ the report SHA-256 is `d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405
 Median FAT listing and extraction were 1.131 ms and 2.804 ms on the hosted Linux runner, while APFS
 listing and extraction were 279.269 ms and 279.073 ms. The hosted performance gate passed.
 
+The final 0.1.3 tag-gated [release run](https://github.com/bwhitn/pydmg/actions/runs/35619257967)
+repeated all nine scenarios with two warmups and nine measured samples on hosted x86-64 Linux. Its
+retained report records both source and checkout revisions as
+`36c6635369652f43a6f88211e905873e51bc1148`, `working_tree_dirty: false`, and `published: true`.
+The report SHA-256 is `fc97decdf5d6d6a6c22f01d9f6725c0a4f4fbe4aaa6903ab8aa85b1b55a92c08`.
+
+| Release scenario | Median wall time |
+| --- | ---: |
+| Import/startup | 2.858 ms |
+| Trailer/plist/BLKX projection | 1.059 ms |
+| Streaming CRC32 | 0.653 ms |
+| Read 20.9 MiB compressed partition | 268.464 ms |
+| Atomically extract that partition | 295.262 ms |
+| List generated 512 MiB FAT32 partition | 1.119 ms |
+| Extract two FAT32 fixture files | 3.080 ms |
+| List Apple-filesystem directory | 280.827 ms |
+| Atomically extract the Apple fixture file | 281.666 ms |
+
+The measured manylinux wheel is 933,805 bytes and its production native extension is 2,412,904
+bytes. These final numbers preserve the large FAT improvement and keep the unchanged Apple path in
+the established hosted range after the narrow streamed Zero/Ignore compatibility correction.
+
 The production macOS wheel grew from 775,910 to 785,256 bytes (+1.20%); its uncompressed native
 extension grew from 1,814,344 to 1,975,224 bytes (+8.87%). This is the measured size cost of the
 bounded seekable partition reader and streaming decoder paths. The opt-in allocator instrumentation

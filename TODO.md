@@ -2,8 +2,8 @@
 
 ## Current
 
-- [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **Version 0.1.2 is published, and
-  the locally verified 0.1.3 compatibility correction, hosted patch gates, and ALES integration remain**:
+- [x] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **Complete in the published 0.1.3
+  release, including hosted release evidence and ALES integration acceptance**:
   - [x] Capture release-mode baselines for generated UDIF/plist/BLKX, compressed-chunk, partition, filesystem, and
     extraction fixtures. Record wall time, CPU, peak memory, allocations/copies, decompressed and written bytes,
     disk I/O, startup/import time, and wheel/native size. `PERFORMANCE.md` and `benchmarks/results/` contain the local
@@ -41,8 +41,8 @@
     Python tests, both rustfmt
     checks, root/fuzz Clippy, Rust tests, fuzz builds, audit-exception and license checks, documentation, rustdoc, and
     version verification. Also require at least 90% Python and 70% native line coverage plus available cargo-audit and
-    both pip-audit forms. All passed locally on 2026-09-21: 22 Python tests, 19 Rust tests on Rust 1.98.1 and 1.88.0,
-    90% Python coverage, 79.78% native line coverage, five ASan fuzz campaigns, and no Cargo/pip audit findings.
+    both pip-audit forms. All passed locally on 2026-09-21: 22 Python tests, 20 Rust tests on Rust 1.98.1 and 1.88.0,
+    90% Python coverage, 80.03% native line coverage, five ASan fuzz campaigns, and no Cargo/pip audit findings.
   - [x] Rebuild production ABI3 wheel/sdist artifacts and rerun `scripts/benchmark.py --publish` from a clean commit so
     the optimized report names the exact candidate SHA. Confirm the large FAT speed/RSS/allocation improvements,
     unchanged logical output, bounded cancellation, and no material regression in the unchanged APFS paths. Final
@@ -51,22 +51,24 @@
     clean worktree, retains a 274.9x FAT-listing speedup and 90.7% FAT-extraction reduction, and keeps unchanged APFS
     timings inside the baseline ranges; report SHA-256 is
     `3fc99a17452b874b78a4b9d78e6d888fd1fe40de0775c0cc4cf8ddd81be203c5`.
-  - [ ] Commit and push the reviewed corrective candidate, then require the complete hosted cross-platform, Rust 1.88
+  - [x] Commit and push the reviewed corrective candidate, then require the complete hosted cross-platform, Rust 1.88
     MSRV, coverage, audit, sanitizer/fuzz, documentation, wheel, and tag-gated release workflows to pass. Fix a failing
-    gate rather than weakening validation or editing retained audit history. The owner restored $20 of Actions
-    capacity on 2026-09-21; complete every locally runnable gate before dispatching the necessary hosted matrices and
-    avoid redundant reruns that consume the limited budget. Candidate commits are pushed in PR
+    gate rather than weakening validation or editing retained audit history. The 0.1.2 candidate was reviewed in PR
     [`#3`](https://github.com/bwhitn/pydmg/pull/3); corrected CI run
     [`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) and fuzz run
     [`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) pass. PR #3 was merged as
     `d5808ff5e928819e2471c57175fa2323eb35f535`, and tagged release run
-    [`35611077830`](https://github.com/bwhitn/pydmg/actions/runs/35611077830) published 0.1.2 successfully. The 0.1.3
-    correction now passes every local gate, including all five ASan targets, but its hosted PR and release gates
-    remain.
-  - [ ] Publish the corrective immutable package release only after those gates pass. Version 0.1.2 is live on PyPI,
-    but authorized ALES acceptance exposed a valid 82,345,984-byte streamed `Ignore` span that its 64 MiB
-    dependency-allocation preflight rejected. The narrow 0.1.3 correction preserves the limit for decoder-backed
-    chunks, passes deterministic and authorized-image regression checks, and awaits hosted release evidence. Update
-    ALES from `pydmg==0.1.1`, refresh
-    `poetry.lock`, and pass DMG analyzer, extraction/lineage, output/ObjectRules, image, SBOM/license, runtime-pruning,
-    and authorized-corpus performance acceptance.
+    [`35611077830`](https://github.com/bwhitn/pydmg/actions/runs/35611077830) published 0.1.2 successfully. Corrective
+    PR [`#4`](https://github.com/bwhitn/pydmg/pull/4) passed complete CI run
+    [`35617605668`](https://github.com/bwhitn/pydmg/actions/runs/35617605668) and all four PR fuzz jobs in run
+    [`35617605544`](https://github.com/bwhitn/pydmg/actions/runs/35617605544), then merged as
+    `36c6635369652f43a6f88211e905873e51bc1148`. Manual release preflight
+    [`35618182500`](https://github.com/bwhitn/pydmg/actions/runs/35618182500) also passed before tagging.
+  - [x] Publish the corrective immutable package release only after those gates pass. Tag `v0.1.3` names exact merge
+    revision `36c6635369652f43a6f88211e905873e51bc1148`; trusted release run
+    [`35619257967`](https://github.com/bwhitn/pydmg/actions/runs/35619257967) passed every quality, security, coverage,
+    performance, fuzz, wheel, sdist, metadata, and publishing job. PyPI serves five non-yanked ABI3 wheels plus the
+    sdist, and a fresh wheel-only install parsed the committed FAT fixture and the authorized Apple image. ALES now
+    exact-pins `pydmg==0.1.3` with refreshed lock hashes and passed its DMG/Docker regressions, 1,959-test host and
+    contained test-image suites, license/SBOM and stripped/pruned runtime checks, exact output/ObjectRules and stored
+    artifact parity, and authorized-corpus performance acceptance.
