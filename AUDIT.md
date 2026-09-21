@@ -45,8 +45,8 @@ decompression, output-safety, CI, release, and fuzz-infrastructure findings have
 The current local suite passes 22 Python integration/adversarial tests and 19 native Rust tests
 (18 cross-platform plus one Unix path-panic regression).
 Ruff, strict mypy, Bandit, rustfmt, and Clippy with warnings denied are green. Python line coverage
-remains 90% and now has a gate; a fresh local Rust 1.98.1 run records 79.78% native lines against
-the separate 70% workflow gate (the last hosted result was 80.75%).
+remains 90% and now has a gate; fresh local and hosted Rust 1.98.1 runs both record 79.78% native
+lines against the separate 70% workflow gate.
 
 The 171 GB BLKX allocation is rejected before entering `apple-dmg`. The malformed APFS case is
 caught at this repository's dependency boundary and returned as `RuntimeError`, but `apfs 0.2.4`
@@ -68,7 +68,7 @@ deployments, but residual third-party resource behavior is deferred in this revi
 | Python tests | 22 passed |
 | Native Rust tests | 19 passed on macOS; 18 cross-platform |
 | Python coverage | 90%; enforced at 90% in CI/release |
-| Native Rust coverage | Local Rust 1.98.1 result 79.78% lines; hosted result 80.75%; 70% gate |
+| Native Rust coverage | Local and current hosted Rust 1.98.1 result 79.78% lines; 70% gate |
 | Python lint/type | Expanded Ruff rules, strict mypy, and consumer stub check pass |
 | Security lint | Bandit passes; three exact false positives have inline rationale |
 | Rust lint | rustfmt and Clippy `-D warnings` pass |
@@ -439,7 +439,9 @@ was 66/73 statements plus branch accounting (90%). Hosted run
 [`29674156138`](https://github.com/bwhitn/pydmg/actions/runs/29674156138) at commit `1de7a87`
 confirmed 90% Python coverage and 80.75% native lines, 60.22% functions, and 79.03% regions.
 A fresh local run with the pinned Rust 1.98.1 compiler reports 79.78% native lines, 59.19%
-functions, and 77.82% regions; both native results remain above the 70% gate.
+functions, and 77.82% regions. The optimized candidate's hosted run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) reproduced exactly those
+native totals and 90% Python coverage; all recorded native results remain above the 70% gate.
 
 ### QA-008 — Fuzzing was not continuous
 
@@ -454,6 +456,11 @@ SEC-011. Hosted run
 [`29674156143`](https://github.com/bwhitn/pydmg/actions/runs/29674156143) passed the bounded `blkx`,
 `chunk`, `dmg_parse`, and `gpt` ASan jobs; the slower whole-image job was skipped on the PR as
 designed and remains a scheduled and release gate.
+
+The optimized candidate's hosted run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) also passed the bounded
+`blkx`, `chunk`, `dmg_parse`, and `gpt` ASan jobs with the pinned dated nightly. Whole-image fuzz was
+again skipped by the documented PR policy and remains mandatory in scheduled and release runs.
 
 The 2026-09-21 post-optimization local campaigns then passed all five targets with
 `nightly-2026-09-01`, cargo-fuzz 0.13.2, and AddressSanitizer: 15,698 `dmg_parse`, 457,781 `blkx`,
@@ -557,7 +564,7 @@ tags.
 
 ### QA-019 — Primary builds and performance claims were not reproducible
 
-- Status: **Resolved locally; immutable hosted evidence required before release**
+- Status: **Resolved and observed in hosted CI**
 
 `rust-toolchain.toml`, every primary CI job, release quality, and every wheel/sdist build now select
 Rust 1.98.1 explicitly; the build backend and release action select maturin 1.14.1. The independent
@@ -572,10 +579,16 @@ dated two-warmup/nine-sample before/after evidence and profile decisions are in
 samples and blocks wheel builds until it succeeds. `--publish` refuses a dirty checkout, preventing
 mutable working-tree measurements from being presented as published evidence.
 
+Hosted PR run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed the performance gate
+from clean synthetic merge commit `5f284af72617cd2a489f5a5ecaaa63495df46b2f`. Its retained
+five-sample report names that revision as both source and checkout, records `published: true`, and
+has SHA-256 `d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405ac063c3`.
+
 ### QA-020 — Implicit rustup components conflicted on some hosted images
 
 - Severity: **Low operational compatibility**
-- Status: **Resolved locally; hosted rerun pending**
+- Status: **Resolved and observed in hosted CI**
 
 The first Rust 1.98.1 pull-request run
 [`35607307980`](https://github.com/bwhitn/pydmg/actions/runs/35607307980) passed lint, native,
@@ -590,6 +603,13 @@ MSRV commands use an explicit `+1.88.0` selector so the repository toolchain ove
 the compatibility lane. Fuzz jobs install both the pinned stable compiler and
 `nightly-2026-09-01` with `rust-src`, and invoke cargo-fuzz through that dated nightly, making each
 toolchain role explicit.
+
+The replacement CI run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed every Linux, macOS,
+and Windows matrix entry plus performance, coverage, security, lint, native, and explicit Rust 1.88
+jobs. The paired fuzz run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) passed all four PR ASan
+targets. This confirms that the explicit toolchain setup resolves the hosted-image collision.
 
 ## Fuzzing evidence
 
@@ -680,8 +700,8 @@ memory availability are retained for completeness but deferred under the current
    nightly, `cargo-fuzz`, or `cargo-llvm-cov`, so a temporary toolchain under `/private/tmp` supplied
    follow-up ASan evidence and hosted CI supplied the 80.75% native line result. As of the 2026-09-21
    review, rustup-managed Rust 1.98.1/1.88.0/nightly plus `cargo-fuzz` and `cargo-llvm-cov` are
-   available locally. Local Rust 1.98.1 native coverage is 79.78%; the historical hosted result
-   remains the last recorded cross-platform gate for the uncommitted change set.
+   available locally. Local and current hosted Rust 1.98.1 native coverage are both 79.78%; the
+   optimized committed candidate has also passed the complete hosted cross-platform PR gate.
 9. No upstream issue, pull request, or external message was created as part of this repository-only
    work. Upstream coordination is therefore still outstanding.
 
@@ -741,10 +761,14 @@ Auditwheel and Twine accepted both artifacts, an isolated install parsed the com
 and the wheel's native dependency list contained only system libraries because liblzma was linked
 statically.
 
-The replacement hosted PR run passed the Python/native coverage job, dependency-security job,
-lint/type/documentation job, native and Rust 1.88 jobs, and the Python 3.9–3.13 Linux, macOS, and
-Windows matrix. All four PR fuzz-smoke jobs also passed; whole-image fuzz was skipped by its
-documented PR policy.
+The replacement hosted PR CI run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) passed the Python/native
+coverage job, dependency-security job, clean-SHA performance job, lint/type/documentation job,
+native and Rust 1.88 jobs, and the Python 3.9–3.13 Linux, macOS, and Windows matrix. Its coverage
+artifact records 90% Python and 79.78% native lines. Its published performance artifact has SHA-256
+`d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405ac063c3`. Paired fuzz run
+[`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) passed all four PR
+fuzz-smoke jobs; whole-image fuzz was skipped by its documented PR policy.
 
 ## Deferred and non-blocking follow-up
 

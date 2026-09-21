@@ -2,9 +2,10 @@
 
 ## 2026-09-21 Rust 1.98.1 optimization
 
-The immutable baseline is commit `564fc270827fc7e5453524e4509ed6ac135fddaa`. The optimized
-measurements below are local pre-commit evidence and are intentionally marked unpublished in the
-machine-readable result. CI and release workflows rerun the suite from a clean checkout and
+The immutable baseline is commit `564fc270827fc7e5453524e4509ed6ac135fddaa`. The primary
+before/after measurements below are local pre-commit evidence and are intentionally marked
+unpublished in the machine-readable result. Clean-commit and hosted evidence is recorded after the
+comparison. CI and release workflows rerun the suite from a clean checkout and
 `scripts/benchmark.py --publish` refuses a dirty tree, so retained published artifacts are tied to
 the exact Git commit SHA.
 
@@ -76,6 +77,14 @@ from a clean worktree. Its report records both `source_revision` and `checked_ou
 extraction were 302.267 ms and 321.394 ms, respectively, both inside the baseline ranges. This
 confirms the material effects and the absence of a material regression in the unchanged APFS path
 using the exact clean candidate source.
+
+Hosted PR run
+[`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) repeated five samples from
+clean synthetic merge commit `5f284af72617cd2a489f5a5ecaaa63495df46b2f`. Its retained report
+records matching source and checkout revisions, `working_tree_dirty: false`, and `published: true`;
+the report SHA-256 is `d5f75273b8039df6674c44c557094aea31c3adce241a1cfbac4c02405ac063c3`.
+Median FAT listing and extraction were 1.131 ms and 2.804 ms on the hosted Linux runner, while APFS
+listing and extraction were 279.269 ms and 279.073 ms. The hosted performance gate passed.
 
 The production macOS wheel grew from 775,910 to 785,256 bytes (+1.20%); its uncompressed native
 extension grew from 1,814,344 to 1,975,224 bytes (+8.87%). This is the measured size cost of the

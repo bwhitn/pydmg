@@ -2,9 +2,8 @@
 
 ## Current
 
-- [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **All locally executable
-  implementation, validation, and clean-SHA publication evidence are complete; hosted gates, release, and ALES
-  integration remain**:
+- [ ] Adopt Rust 1.98.1 and optimize measured DMG analysis/extraction hot paths — **Implementation, local validation,
+  clean-SHA publication evidence, and the hosted PR gates are complete; merge, release, and ALES integration remain**:
   - [x] Capture release-mode baselines for generated UDIF/plist/BLKX, compressed-chunk, partition, filesystem, and
     extraction fixtures. Record wall time, CPU, peak memory, allocations/copies, decompressed and written bytes,
     disk I/O, startup/import time, and wheel/native size. `PERFORMANCE.md` and `benchmarks/results/` contain the local
@@ -55,7 +54,11 @@
     coverage, audit, sanitizer/fuzz, documentation, wheel, and tag-gated release workflows to pass. Fix a failing gate
     rather than weakening validation or editing retained audit history. The owner restored $20 of Actions capacity on
     2026-09-21; complete every locally runnable gate before dispatching the necessary hosted matrices and avoid
-    redundant reruns that consume the limited budget.
+    redundant reruns that consume the limited budget. Candidate commits are pushed in PR
+    [`#3`](https://github.com/bwhitn/pydmg/pull/3); corrected CI run
+    [`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) and fuzz run
+    [`35608047919`](https://github.com/bwhitn/pydmg/actions/runs/35608047919) pass. Merge and the tag-gated release
+    workflow remain.
   - [ ] Publish the new immutable package release only after those gates pass. Update ALES from `pydmg==0.1.1`, refresh
     `poetry.lock`, and pass DMG analyzer, extraction/lineage, output/ObjectRules, image, SBOM/license, runtime-pruning,
     and authorized-corpus performance acceptance.
