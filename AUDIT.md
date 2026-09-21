@@ -572,6 +572,25 @@ dated two-warmup/nine-sample before/after evidence and profile decisions are in
 samples and blocks wheel builds until it succeeds. `--publish` refuses a dirty checkout, preventing
 mutable working-tree measurements from being presented as published evidence.
 
+### QA-020 — Implicit rustup components conflicted on some hosted images
+
+- Severity: **Low operational compatibility**
+- Status: **Resolved locally; hosted rerun pending**
+
+The first Rust 1.98.1 pull-request run
+[`35607307980`](https://github.com/bwhitn/pydmg/actions/runs/35607307980) passed lint, native,
+coverage, security, MSRV, and most Python jobs, but three Python matrix entries and the performance
+job stopped while rustup tried to add `rustfmt` and `clippy` implicitly. Those runner images already
+contained the component binaries without matching component metadata, so rustup reported a
+`bin/cargo-fmt` conflict. No project compilation or test failed.
+
+`rust-toolchain.toml` now pins only the exact compiler and minimal profile; workflow jobs that need
+rustfmt, Clippy, or LLVM tools install those components explicitly in the toolchain setup action.
+MSRV commands use an explicit `+1.88.0` selector so the repository toolchain override cannot mask
+the compatibility lane. Fuzz jobs install both the pinned stable compiler and
+`nightly-2026-09-01` with `rust-src`, and invoke cargo-fuzz through that dated nightly, making each
+toolchain role explicit.
+
 ## Fuzzing evidence
 
 Initial campaigns used `cargo-fuzz 0.13.2`, nightly Rust, sanitizer-instrumented standard library,

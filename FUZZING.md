@@ -23,8 +23,8 @@ rejection boundaries.
 ## Prerequisites
 
 ```bash
-rustup toolchain install nightly --profile minimal --component rust-src
-cargo install cargo-fuzz --version 0.13.2 --locked
+rustup toolchain install nightly-2026-09-01 --profile minimal --component rust-src
+cargo +nightly-2026-09-01 install cargo-fuzz --version 0.13.2 --locked
 python -m pip install -e ".[dev]"
 ```
 
@@ -69,27 +69,27 @@ run; an uncontained panic still reaches libFuzzer's outer catch and fails the pr
 artifact and a post-preflight 68-second ASan campaign now complete without a new failure.
 
 ```bash
-cargo +nightly fuzz run --sanitizer address --build-std dmg_parse \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std dmg_parse \
   "${PYDMG_FUZZ_CORPUS}/dmg_parse" -- \
   -max_total_time=300 -max_len=4194304 -timeout=10 -rss_limit_mb=3072 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std blkx \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std blkx \
   "${PYDMG_FUZZ_CORPUS}/blkx" -- \
   -max_total_time=300 -max_len=1048576 -timeout=5 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std chunk \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std chunk \
   "${PYDMG_FUZZ_CORPUS}/chunk" -- \
   -max_total_time=300 -max_len=1048576 -timeout=5 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std gpt \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std gpt \
   "${PYDMG_FUZZ_CORPUS}/gpt" -- \
   -max_total_time=300 -max_len=4194304 -timeout=10 -rss_limit_mb=2048 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
 
-cargo +nightly fuzz run --sanitizer address --build-std image \
+cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std image \
   "${PYDMG_FUZZ_CORPUS}/image" -- \
   -max_total_time=300 -max_len=4194304 -timeout=30 -rss_limit_mb=4096 \
   -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1
@@ -110,8 +110,8 @@ does not print a crash input or Base64 reproducer into the public log.
 location.
 
 ```bash
-cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<artifact>
-cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/<artifact>
+cargo +nightly-2026-09-01 fuzz run <target> fuzz/artifacts/<target>/<artifact>
+cargo +nightly-2026-09-01 fuzz tmin <target> fuzz/artifacts/<target>/<artifact>
 ```
 
 For each unique finding:
@@ -135,8 +135,8 @@ growth, and reach successful parser paths as well as rejection paths. Generate a
 after corpus minimization:
 
 ```bash
-cargo +nightly fuzz cmin <target> "${PYDMG_FUZZ_CORPUS}/<target>"
-cargo +nightly fuzz coverage <target> "${PYDMG_FUZZ_CORPUS}/<target>"
+cargo +nightly-2026-09-01 fuzz cmin <target> "${PYDMG_FUZZ_CORPUS}/<target>"
+cargo +nightly-2026-09-01 fuzz coverage <target> "${PYDMG_FUZZ_CORPUS}/<target>"
 ```
 
 The dated baseline and its limitations are recorded in [`AUDIT.md`](AUDIT.md). A bounded clean run

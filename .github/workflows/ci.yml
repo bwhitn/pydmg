@@ -133,8 +133,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
         with:
           toolchain: "1.88.0"
-      - run: cargo check --locked --all-features
-      - run: cargo test --locked --all-targets --all-features
+      - run: rustc +1.88.0 --version --verbose
+      - run: cargo +1.88.0 check --locked --all-features
+      - run: cargo +1.88.0 test --locked --all-targets --all-features
 
   security:
     name: Dependency Security

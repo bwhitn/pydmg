@@ -55,12 +55,15 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
         with:
-          toolchain: nightly
+          toolchain: "1.98.1"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: nightly-2026-09-01
           components: rust-src
 
       - name: Install fuzz tooling
         run: |
-          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +nightly-2026-09-01 install cargo-fuzz --version 0.13.2 --locked
           python -m pip install -e ".[test]"
 
       - name: Prepare structure-aware corpus
@@ -69,7 +72,7 @@ jobs:
       - name: Run bounded AddressSanitizer campaign
         run: |
           fuzz_log="${RUNNER_TEMP}/fuzz-${{ matrix.target }}.log"
-          if cargo fuzz run --sanitizer address --build-std "${{ matrix.target }}" \
+          if cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std "${{ matrix.target }}" \
               "${{ runner.temp }}/corpus/${{ matrix.target }}" -- \
               -max_total_time="${FUZZ_SECONDS}" \
               -max_len="${{ matrix.max_len }}" \
@@ -96,12 +99,15 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
         with:
-          toolchain: nightly
+          toolchain: "1.98.1"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: nightly-2026-09-01
           components: rust-src
 
       - name: Install fuzz tooling
         run: |
-          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +nightly-2026-09-01 install cargo-fuzz --version 0.13.2 --locked
           python -m pip install -e ".[test]"
 
       - name: Prepare structure-aware corpus
@@ -110,7 +116,7 @@ jobs:
       - name: Run whole-image AddressSanitizer campaign
         run: |
           fuzz_log="${RUNNER_TEMP}/fuzz-image.log"
-          if cargo fuzz run --sanitizer address --build-std image \
+          if cargo +nightly-2026-09-01 fuzz run --sanitizer address --build-std image \
               "${{ runner.temp }}/corpus/image" -- \
               -max_total_time=300 -max_len=4194304 -timeout=30 -rss_limit_mb=4096 \
               -dict=fuzz/dictionaries/dmg.dict -print_final_stats=1 \
