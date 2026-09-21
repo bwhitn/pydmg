@@ -130,6 +130,25 @@ def test_partition_extract_replaces_link_without_following_it(tmp_path: Path) ->
     assert outside.read_bytes() == b"outside sentinel"
 
 
+def test_partition_extract_failure_preserves_existing_output(tmp_path: Path) -> None:
+    source = Path(__file__).parent / "fixtures" / "fat32-large-sample.dmg"
+    partition = pydmg.list_partitions(source)[1]
+    chunk = next(
+        item for item in partition["table"]["chunks"] if item["chunk_type"] == "Zlib"
+    )
+    contents = bytearray(source.read_bytes())
+    contents[chunk["compressed_offset"]] ^= 0xFF
+    malformed = tmp_path / "corrupt-zlib.dmg"
+    malformed.write_bytes(contents)
+
+    destination = tmp_path / "partition.bin"
+    destination.write_bytes(b"existing output")
+    with pytest.raises(RuntimeError):
+        pydmg.extract_partition(malformed, 1, destination)
+
+    assert destination.read_bytes() == b"existing output"
+
+
 def test_fat32_listing_and_extraction(tmp_path: Path) -> None:
     source, dmg = _build_dmg(tmp_path)
 

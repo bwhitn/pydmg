@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin==1.14.1"]
 build-backend = "maturin"
 
 [project]
 name = "pydmg"
-version = "0.1.0"
+version = "0.1.2"
 description = "Read, inspect, and create Apple DMG files from Python"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,7 +46,7 @@ test = [
 dev = [
   "bandit>=1.7.10",
   "coverage[toml]>=7.6",
-  "maturin>=1.7,<2.0",
+  "maturin==1.14.1",
   "mypy>=1.13,<2",
   "pip-audit>=2.7",
   "pytest>=8.0",

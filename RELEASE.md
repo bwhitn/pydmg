@@ -2,6 +2,9 @@
 
 Use this checklist for every PyPI release.
 
+Repository builds use the exact Rust 1.98.1 toolchain in `rust-toolchain.toml`; the separate Rust
+1.88.0 CI job preserves the declared crate MSRV. Release wheel jobs also pin maturin 1.14.1.
+
 ## One-time setup
 
 1. Create the `pydmg` project on PyPI.
@@ -14,7 +17,7 @@ Use this checklist for every PyPI release.
 
 ## Per-release steps
 
-1. Choose the release version, for example `0.1.0`.
+1. Choose the release version, for example `0.1.2`.
 2. Ensure versions match in both files:
    - `pyproject.toml`: `project.version`
    - `Cargo.toml`: `package.version`
@@ -22,7 +25,7 @@ Use this checklist for every PyPI release.
 
 ```bash
 . .venv/bin/activate
-python scripts/verify_versions.py --expected 0.1.0
+python scripts/verify_versions.py --expected 0.1.2
 python scripts/check_audit_exceptions.py
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
@@ -45,7 +48,8 @@ coverage report --fail-under=90
 ```
 
 Generate Python and native Rust coverage reports, and investigate any regression from the baseline
-in [`AUDIT.md`](AUDIT.md). Run all bounded AddressSanitizer fuzz campaigns in
+in [`AUDIT.md`](AUDIT.md). Review the release-mode measurements and artifact-size delta described
+in [`PERFORMANCE.md`](PERFORMANCE.md). Run all bounded AddressSanitizer fuzz campaigns in
 [`FUZZING.md`](FUZZING.md); parser or dependency changes require a longer campaign. Do not release
 with an unexplained advisory, sanitizer finding, crash, hang, or uncontrolled allocation.
 
@@ -63,23 +67,25 @@ twine check dist/*
 6. Create and push the release tag:
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.2 -m "Release v0.1.2"
+git push origin v0.1.2
 ```
 
 7. Watch the `Release` workflow in GitHub Actions.
+   - Confirm the SHA-named nine-sample performance artifact passed before wheel builds started.
+   - Confirm its `source_revision` is the release tag's immutable commit and `published` is true.
 8. Confirm artifacts appear on PyPI and install test passes:
 
 ```bash
-pip install pydmg==0.1.0
+pip install pydmg==0.1.2
 python -c "import pydmg; print(pydmg.__version__)"
 ```
 
 ## Notes
 
 - The release workflow enforces version consistency, lint, strict typing, tests, advisory and
-  license policy, Python/native coverage floors, documentation, and direct-parser fuzz smoke before
-  it builds or publishes artifacts.
+  license policy, Python/native coverage floors, documentation, release performance evidence, and
+  direct-parser fuzz smoke before it builds or publishes artifacts.
 - `sdist` is included as the architecture-independent source distribution.
 - You can run `workflow_dispatch` manually and provide `release_version` for preflight checks.
 - License policy is validated via `scripts/check_licenses.py`.

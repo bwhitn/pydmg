@@ -1,5 +1,10 @@
 #![cfg_attr(all(feature = "fuzzing", not(feature = "python")), allow(dead_code))]
 
+#[cfg(feature = "benchmarking")]
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    sync::atomic::{AtomicU64, Ordering},
+};
 use std::{
     any::Any,
     fs::{self, File},
@@ -30,6 +35,144 @@ use udif::{
     DmgArchive as UdifDmgArchive, DmgReaderOptions as UdifDmgReaderOptions,
     PartitionType as UdifPartitionType,
 };
+
+#[cfg(feature = "benchmarking")]
+struct CountingAllocator;
+
+#[cfg(feature = "benchmarking")]
+static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static REALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static REALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static DEALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static STAGING_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static COMPRESSED_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static DECODED_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "benchmarking")]
+static SINK_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "benchmarking")]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: this wrapper forwards the unchanged layout to the system allocator.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: this wrapper forwards the unchanged layout to the system allocator.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller supplies the pointer and layout accepted by GlobalAlloc.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: this wrapper forwards the allocation and requested size unchanged.
+        let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+        if !new_pointer.is_null() {
+            REALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+            REALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        }
+        new_pointer
+    }
+}
+
+#[cfg(feature = "benchmarking")]
+#[global_allocator]
+static BENCHMARK_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(feature = "benchmarking")]
+#[derive(Serialize)]
+struct BenchmarkMetrics {
+    allocation_calls: u64,
+    allocated_bytes: u64,
+    reallocation_calls: u64,
+    reallocated_bytes: u64,
+    deallocation_calls: u64,
+    deallocated_bytes: u64,
+    staging_copy_bytes: u64,
+    compressed_input_bytes: u64,
+    decoded_output_bytes: u64,
+    sink_written_bytes: u64,
+}
+
+#[cfg(feature = "benchmarking")]
+fn reset_benchmark_metrics() {
+    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    REALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    REALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    DEALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    DEALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    STAGING_COPY_BYTES.store(0, Ordering::Relaxed);
+    COMPRESSED_INPUT_BYTES.store(0, Ordering::Relaxed);
+    DECODED_OUTPUT_BYTES.store(0, Ordering::Relaxed);
+    SINK_WRITTEN_BYTES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "benchmarking")]
+fn benchmark_metrics() -> BenchmarkMetrics {
+    BenchmarkMetrics {
+        allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
+        allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+        reallocation_calls: REALLOCATION_CALLS.load(Ordering::Relaxed),
+        reallocated_bytes: REALLOCATED_BYTES.load(Ordering::Relaxed),
+        deallocation_calls: DEALLOCATION_CALLS.load(Ordering::Relaxed),
+        deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+        staging_copy_bytes: STAGING_COPY_BYTES.load(Ordering::Relaxed),
+        compressed_input_bytes: COMPRESSED_INPUT_BYTES.load(Ordering::Relaxed),
+        decoded_output_bytes: DECODED_OUTPUT_BYTES.load(Ordering::Relaxed),
+        sink_written_bytes: SINK_WRITTEN_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "benchmarking")]
+fn record_staging_copy(bytes: usize) {
+    STAGING_COPY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "benchmarking"))]
+fn record_staging_copy(_bytes: usize) {}
+
+#[cfg(feature = "benchmarking")]
+fn record_decode(input_bytes: u64, output_bytes: usize) {
+    COMPRESSED_INPUT_BYTES.fetch_add(input_bytes, Ordering::Relaxed);
+    DECODED_OUTPUT_BYTES.fetch_add(output_bytes as u64, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "benchmarking"))]
+fn record_decode(_input_bytes: u64, _output_bytes: usize) {}
+
+#[cfg(feature = "benchmarking")]
+fn record_sink_write(bytes: u64) {
+    SINK_WRITTEN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "benchmarking"))]
+fn record_sink_write(_bytes: u64) {}
 
 const SECTOR_SIZE: u64 = 512;
 const KOLY_TRAILER_SIZE: u64 = 512;
@@ -1013,43 +1156,64 @@ fn expect_array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
     }
 }
 
-fn read_exact_at<R: Read + Seek>(
+#[derive(Default)]
+struct DecodeBuffers {
+    compressed: Vec<u8>,
+    decoded: Vec<u8>,
+}
+
+fn seek_to_payload<R: Read + Seek>(
     reader: &mut R,
     input_size: u64,
     offset: u64,
     length: u64,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     validate_file_range(input_size, offset, length, "chunk payload")?;
     if length > MAX_COMPRESSED_CHUNK_BYTES {
         bail!("chunk payload length {length} exceeds limit {MAX_COMPRESSED_CHUNK_BYTES}");
     }
-    let len = usize::try_from(length).context("payload length does not fit usize")?;
     reader
         .seek(SeekFrom::Start(offset))
         .with_context(|| format!("unable to seek to payload at offset {offset}"))?;
-    let mut buffer = vec![0_u8; len];
-    reader
-        .read_exact(&mut buffer)
-        .with_context(|| format!("unable to read payload at offset {offset}, length {length}"))?;
-    Ok(buffer)
+    Ok(())
 }
 
-fn bounded_decode<R: Read>(decoder: R, output_limit: u64, label: &str) -> Result<Vec<u8>> {
+fn read_exact_at_into<R: Read + Seek>(
+    reader: &mut R,
+    input_size: u64,
+    offset: u64,
+    length: u64,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    seek_to_payload(reader, input_size, offset, length)?;
+    let len = usize::try_from(length).context("payload length does not fit usize")?;
+    buffer.clear();
+    buffer
+        .try_reserve(len)
+        .context("unable to reserve compressed-chunk buffer")?;
+    buffer.resize(len, 0);
+    reader
+        .read_exact(buffer)
+        .with_context(|| format!("unable to read payload at offset {offset}, length {length}"))?;
+    Ok(())
+}
+
+fn bounded_copy<R: Read, W: Write>(
+    decoder: R,
+    output_limit: u64,
+    label: &str,
+    writer: &mut W,
+) -> Result<u64> {
     let read_limit = output_limit
         .checked_add(1)
         .ok_or_else(|| anyhow!("{label} output limit overflow"))?;
     let mut limited = decoder.take(read_limit);
-    let initial_capacity = usize::try_from(output_limit.min(1024 * 1024))
-        .context("decoder capacity does not fit usize")?;
-    let mut decoded = Vec::with_capacity(initial_capacity);
-    limited
-        .read_to_end(&mut decoded)
+    let written = io::copy(&mut limited, writer)
         .with_context(|| format!("unable to {label}-decompress chunk"))?;
-    let decoded_len = u64::try_from(decoded.len()).context("decoded length does not fit u64")?;
-    if decoded_len > output_limit {
+    if written > output_limit {
         bail!("{label} output exceeds limit {output_limit}");
     }
-    Ok(decoded)
+    Ok(written)
 }
 
 fn compressed_output_limit(chunk: &BlkxChunk, remaining_output: u64) -> Result<u64> {
@@ -1069,17 +1233,33 @@ fn compressed_output_limit(chunk: &BlkxChunk, remaining_output: u64) -> Result<u
     Ok(declared)
 }
 
-fn decode_chunk<R: Read + Seek>(
+fn write_zeroes<W: Write>(writer: &mut W, length: u64) -> Result<()> {
+    static ZEROES: [u8; 128 * 1024] = [0; 128 * 1024];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = usize::try_from(remaining.min(ZEROES.len() as u64))
+            .context("zero-fill write length does not fit usize")?;
+        writer
+            .write_all(&ZEROES[..count])
+            .context("unable to write zero-fill chunk")?;
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+fn decode_chunk_to<R: Read + Seek, W: Write>(
     reader: &mut R,
     input_size: u64,
     chunk: &BlkxChunk,
     remaining_output: u64,
-) -> Result<Vec<u8>> {
+    writer: &mut W,
+    buffers: &mut DecodeBuffers,
+) -> Result<u64> {
     let chunk_type = chunk
         .ty()
         .ok_or_else(|| anyhow!("unknown chunk type: 0x{:08x}", chunk.r#type))?;
 
-    match chunk_type {
+    let written = match chunk_type {
         ChunkType::Raw => {
             if chunk.compressed_length > remaining_output {
                 bail!(
@@ -1087,39 +1267,51 @@ fn decode_chunk<R: Read + Seek>(
                     chunk.compressed_length
                 );
             }
-            read_exact_at(
+            seek_to_payload(
                 reader,
                 input_size,
                 chunk.compressed_offset,
                 chunk.compressed_length,
-            )
+            )?;
+            let mut payload = reader.take(chunk.compressed_length);
+            let written = io::copy(&mut payload, writer).context("unable to copy raw chunk")?;
+            if written != chunk.compressed_length {
+                bail!(
+                    "raw chunk ended after {written} bytes; expected {}",
+                    chunk.compressed_length
+                );
+            }
+            written
         }
         ChunkType::Zlib => {
-            let compressed = read_exact_at(
+            seek_to_payload(
                 reader,
                 input_size,
                 chunk.compressed_offset,
                 chunk.compressed_length,
             )?;
             let output_limit = compressed_output_limit(chunk, remaining_output)?;
-            bounded_decode(ZlibDecoder::new(&compressed[..]), output_limit, "zlib")
+            let payload = reader.take(chunk.compressed_length);
+            bounded_copy(ZlibDecoder::new(payload), output_limit, "zlib", writer)?
         }
         ChunkType::Bzlib => {
-            let compressed = read_exact_at(
+            seek_to_payload(
                 reader,
                 input_size,
                 chunk.compressed_offset,
                 chunk.compressed_length,
             )?;
             let output_limit = compressed_output_limit(chunk, remaining_output)?;
-            bounded_decode(BzDecoder::new(&compressed[..]), output_limit, "bzip2")
+            let payload = reader.take(chunk.compressed_length);
+            bounded_copy(BzDecoder::new(payload), output_limit, "bzip2", writer)?
         }
         ChunkType::Lzfse => {
-            let compressed = read_exact_at(
+            read_exact_at_into(
                 reader,
                 input_size,
                 chunk.compressed_offset,
                 chunk.compressed_length,
+                &mut buffers.compressed,
             )?;
             if chunk.sector_count == 0 {
                 bail!("LZFSE chunk is missing a declared expanded sector count");
@@ -1129,18 +1321,25 @@ fn decode_chunk<R: Read + Seek>(
                 .checked_add(1)
                 .and_then(|size| usize::try_from(size).ok())
                 .ok_or_else(|| anyhow!("LZFSE output buffer size overflow"))?;
-            let mut decoded = vec![0_u8; buffer_len];
-            let decoded_len = lzfse::decode_buffer(&compressed, &mut decoded)
+            buffers.decoded.clear();
+            buffers
+                .decoded
+                .try_reserve(buffer_len)
+                .context("unable to reserve LZFSE output buffer")?;
+            buffers.decoded.resize(buffer_len, 0);
+            let decoded_len = lzfse::decode_buffer(&buffers.compressed, &mut buffers.decoded)
                 .map_err(|error| anyhow!("unable to LZFSE-decompress chunk: {error:?}"))?;
             let decoded_len_u64 =
                 u64::try_from(decoded_len).context("LZFSE decoded length does not fit u64")?;
             if decoded_len_u64 > output_limit {
                 bail!("LZFSE output exceeds declared size {output_limit}");
             }
-            decoded.truncate(decoded_len);
-            Ok(decoded)
+            writer
+                .write_all(&buffers.decoded[..decoded_len])
+                .context("unable to write LZFSE output")?;
+            decoded_len_u64
         }
-        ChunkType::Zero | ChunkType::Ignore | ChunkType::Comment => {
+        ChunkType::Zero | ChunkType::Ignore => {
             let raw_len = if chunk.sector_count > 0 {
                 chunk
                     .sector_count
@@ -1154,17 +1353,55 @@ fn decode_chunk<R: Read + Seek>(
                     "zero-fill chunk length {raw_len} exceeds remaining partition limit {remaining_output}"
                 );
             }
-            let len = usize::try_from(raw_len).context("zero-fill length does not fit usize")?;
-            Ok(vec![0_u8; len])
+            write_zeroes(writer, raw_len)?;
+            raw_len
         }
-        ChunkType::Term => Ok(Vec::new()),
+        ChunkType::Comment | ChunkType::Term => 0,
         ChunkType::Adc => {
             bail!("ADC compression is unsupported by the upstream DMG decoder")
         }
-    }
+    };
+    let output_bytes = usize::try_from(written).context("decoded length does not fit usize")?;
+    record_decode(chunk.compressed_length, output_bytes);
+    Ok(written)
 }
 
-fn read_partition_bytes(path: &Path, partition: &PartitionRecord) -> Result<Vec<u8>> {
+#[cfg(any(test, feature = "fuzzing"))]
+fn decode_chunk<R: Read + Seek>(
+    reader: &mut R,
+    input_size: u64,
+    chunk: &BlkxChunk,
+    remaining_output: u64,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    decode_chunk_to(
+        reader,
+        input_size,
+        chunk,
+        remaining_output,
+        &mut output,
+        &mut DecodeBuffers::default(),
+    )?;
+    Ok(output)
+}
+
+fn partition_output_size(partition: &PartitionRecord) -> Result<u64> {
+    let output_size = partition
+        .table
+        .sector_count
+        .checked_mul(SECTOR_SIZE)
+        .ok_or_else(|| anyhow!("partition output size overflow"))?;
+    if output_size > MAX_PARTITION_BYTES {
+        bail!("partition output exceeds limit {MAX_PARTITION_BYTES}");
+    }
+    Ok(output_size)
+}
+
+fn write_partition_to<W: Write>(
+    path: &Path,
+    partition: &PartitionRecord,
+    writer: &mut W,
+) -> Result<u64> {
     let file =
         File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?;
     let input_size = file
@@ -1172,25 +1409,258 @@ fn read_partition_bytes(path: &Path, partition: &PartitionRecord) -> Result<Vec<
         .with_context(|| format!("unable to stat DMG: {}", path.display()))?
         .len();
     let mut reader = BufReader::new(file);
+    let expected = partition_output_size(partition)?;
+    let mut written = 0_u64;
+    let mut buffers = DecodeBuffers::default();
 
-    let mut out = Vec::new();
     for chunk in &partition.table.chunks {
-        let current_len = u64::try_from(out.len()).context("partition length does not fit u64")?;
-        let remaining = MAX_PARTITION_BYTES
-            .checked_sub(current_len)
-            .ok_or_else(|| anyhow!("partition output exceeds limit {MAX_PARTITION_BYTES}"))?;
-        let mut chunk_data = decode_chunk(&mut reader, input_size, chunk, remaining)?;
-        let combined = out
-            .len()
-            .checked_add(chunk_data.len())
+        let remaining = expected
+            .checked_sub(written)
+            .ok_or_else(|| anyhow!("partition output exceeds declared size {expected}"))?;
+        let chunk_written = decode_chunk_to(
+            &mut reader,
+            input_size,
+            chunk,
+            remaining,
+            writer,
+            &mut buffers,
+        )?;
+        written = written
+            .checked_add(chunk_written)
             .ok_or_else(|| anyhow!("partition output size overflow"))?;
-        if u64::try_from(combined).unwrap_or(u64::MAX) > MAX_PARTITION_BYTES {
-            bail!("partition output exceeds limit {MAX_PARTITION_BYTES}");
-        }
-        out.append(&mut chunk_data);
     }
 
+    if written != expected {
+        bail!("partition produced {written} bytes; expected {expected}");
+    }
+    Ok(written)
+}
+
+fn read_partition_bytes(path: &Path, partition: &PartitionRecord) -> Result<Vec<u8>> {
+    let expected = partition_output_size(partition)?;
+    let capacity = usize::try_from(expected).context("partition size does not fit usize")?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .context("unable to reserve partition output buffer")?;
+    write_partition_to(path, partition, &mut out)?;
     Ok(out)
+}
+
+#[derive(Debug)]
+struct PartitionSpan {
+    chunk_index: usize,
+    start: u64,
+    end: u64,
+}
+
+struct PartitionReader<'a> {
+    reader: BufReader<File>,
+    input_size: u64,
+    chunks: &'a [BlkxChunk],
+    spans: Vec<PartitionSpan>,
+    size: u64,
+    position: u64,
+    cached_span: Option<usize>,
+    cache: Vec<u8>,
+    decode_buffers: DecodeBuffers,
+}
+
+impl<'a> PartitionReader<'a> {
+    fn open(path: &Path, partition: &'a PartitionRecord) -> Result<Self> {
+        let file =
+            File::open(path).with_context(|| format!("unable to open DMG: {}", path.display()))?;
+        let input_size = file
+            .metadata()
+            .with_context(|| format!("unable to stat DMG: {}", path.display()))?
+            .len();
+        let size = partition_output_size(partition)?;
+        let mut spans = Vec::with_capacity(partition.table.chunks.len());
+        for (chunk_index, chunk) in partition.table.chunks.iter().enumerate() {
+            if matches!(chunk.ty(), Some(ChunkType::Comment | ChunkType::Term)) {
+                continue;
+            }
+            let start = chunk
+                .sector_number
+                .checked_mul(SECTOR_SIZE)
+                .ok_or_else(|| anyhow!("partition chunk byte offset overflow"))?;
+            let length = chunk
+                .sector_count
+                .checked_mul(SECTOR_SIZE)
+                .ok_or_else(|| anyhow!("partition chunk byte length overflow"))?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| anyhow!("partition chunk byte range overflow"))?;
+            if end > size {
+                bail!("partition chunk range {start}..{end} exceeds partition size {size}");
+            }
+            spans.push(PartitionSpan {
+                chunk_index,
+                start,
+                end,
+            });
+        }
+
+        Ok(Self {
+            reader: BufReader::new(file),
+            input_size,
+            chunks: &partition.table.chunks,
+            spans,
+            size,
+            position: 0,
+            cached_span: None,
+            cache: Vec::new(),
+            decode_buffers: DecodeBuffers::default(),
+        })
+    }
+
+    fn span_at(&self, position: u64) -> Option<usize> {
+        self.spans
+            .binary_search_by(|span| {
+                if position < span.start {
+                    std::cmp::Ordering::Greater
+                } else if position >= span.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+    }
+
+    fn load_span(&mut self, span_index: usize) -> io::Result<()> {
+        if self.cached_span == Some(span_index) {
+            return Ok(());
+        }
+        let span = self.spans.get(span_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition span index is out of range",
+            )
+        })?;
+        let chunk = self.chunks.get(span.chunk_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition chunk index is out of range",
+            )
+        })?;
+        let expected = span.end - span.start;
+        let capacity = usize::try_from(expected).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition chunk size does not fit usize",
+            )
+        })?;
+        self.cache.clear();
+        self.cache
+            .try_reserve(capacity)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let written = decode_chunk_to(
+            &mut self.reader,
+            self.input_size,
+            chunk,
+            expected,
+            &mut self.cache,
+            &mut self.decode_buffers,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if written != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("partition chunk produced {written} bytes; expected {expected}"),
+            ));
+        }
+        self.cached_span = Some(span_index);
+        Ok(())
+    }
+}
+
+impl Read for PartitionReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.size {
+            return Ok(0);
+        }
+
+        let mut total = 0_usize;
+        while total < buffer.len() && self.position < self.size {
+            let span_index = self.span_at(self.position).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("partition has no chunk covering byte {}", self.position),
+                )
+            })?;
+            let span = &self.spans[span_index];
+            let within = usize::try_from(self.position - span.start).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "partition chunk offset does not fit usize",
+                )
+            })?;
+            let available = usize::try_from(span.end - self.position).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "partition chunk remaining size does not fit usize",
+                )
+            })?;
+            let count = available.min(buffer.len() - total);
+            let chunk_type = self.chunks[span.chunk_index].ty();
+
+            if matches!(chunk_type, Some(ChunkType::Zero | ChunkType::Ignore)) {
+                buffer[total..total + count].fill(0);
+                record_decode(0, count);
+            } else {
+                self.load_span(span_index)?;
+                let end = within.checked_add(count).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "partition cache range overflow")
+                })?;
+                let source = self.cache.get(within..end).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "partition cache range is out of bounds",
+                    )
+                })?;
+                buffer[total..total + count].copy_from_slice(source);
+                record_staging_copy(count);
+            }
+
+            total += count;
+            self.position = self
+                .position
+                .checked_add(count as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "position overflow"))?;
+        }
+        Ok(total)
+    }
+}
+
+impl Seek for PartitionReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let resolved = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.size) + i128::from(offset),
+        };
+        if !(0..=i128::from(u64::MAX)).contains(&resolved) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek outside the partition address space",
+            ));
+        }
+        self.position = resolved as u64;
+        Ok(self.position)
+    }
+}
+
+impl Write for PartitionReader<'_> {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DMG partition reader is read-only",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn data_fork_checksum(path: &Path, koly: &KolyTrailer) -> Result<u32> {
@@ -1684,8 +2154,13 @@ fn fat_type_name(fat_type: FatType) -> &'static str {
     }
 }
 
-fn open_fat_filesystem(bytes: Vec<u8>) -> io::Result<FileSystem<BudgetedIo<Cursor<Vec<u8>>>>> {
-    FileSystem::new(BudgetedIo::new(Cursor::new(bytes)), FsOptions::new())
+fn open_fat_filesystem<'a>(
+    path: &Path,
+    partition: &'a PartitionRecord,
+) -> Result<FileSystem<BudgetedIo<PartitionReader<'a>>>> {
+    let reader = PartitionReader::open(path, partition)?;
+    FileSystem::new(BudgetedIo::new(reader), FsOptions::new())
+        .context("unable to open FAT filesystem from partition data")
 }
 
 fn detect_fat_filesystems(
@@ -1696,19 +2171,8 @@ fn detect_fat_filesystems(
     let mut errors = Vec::new();
 
     for partition in partitions {
-        let bytes = match read_partition_bytes(path, partition) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                errors.push(format!(
-                    "partition {} ({}) read failed: {}",
-                    partition.index, partition.name, error
-                ));
-                continue;
-            }
-        };
-
         let detected = catch_dependency_panic("FAT filesystem detection", || {
-            let fs = match open_fat_filesystem(bytes) {
+            let fs = match open_fat_filesystem(path, partition) {
                 Ok(fs) => fs,
                 Err(_) => return Ok(None),
             };
@@ -1992,6 +2456,10 @@ fn open_udif_apple_filesystem(path: &Path) -> Result<AppleFsHandle> {
     if reported != written {
         bail!("DMG filesystem extractor reported {reported} bytes but wrote {written}");
     }
+    record_decode(
+        partition.compressed_size,
+        usize::try_from(written).unwrap_or(usize::MAX),
+    );
 
     temporary
         .seek(SeekFrom::Start(0))
@@ -2364,6 +2832,7 @@ fn extract_apple_file_impl(path: &Path, file_path: &str, output_path: &Path) -> 
         }
         Ok(limited.written())
     })?;
+    record_sink_write(written);
     persist_atomic_output(temporary, output_path)?;
     Ok(written)
 }
@@ -2559,9 +3028,7 @@ fn list_fat32_entries_unchecked(path: &Path, partition_index: usize) -> Result<V
         .partitions
         .get(partition_index)
         .ok_or_else(|| anyhow!("partition index {partition_index} out of range"))?;
-    let bytes = read_partition_bytes(path, partition)?;
-    let fs = open_fat_filesystem(bytes)
-        .context("unable to open FAT32 filesystem from partition data")?;
+    let fs = open_fat_filesystem(path, partition)?;
 
     let mut entries = Vec::new();
     let mut budget = FilesystemBudget::default();
@@ -2747,9 +3214,7 @@ fn extract_fat32_unchecked(
         .partitions
         .get(partition_index)
         .ok_or_else(|| anyhow!("partition index {partition_index} out of range"))?;
-    let bytes = read_partition_bytes(path, partition)?;
-    let fs = open_fat_filesystem(bytes)
-        .context("unable to open FAT32 filesystem from partition data")?;
+    let fs = open_fat_filesystem(path, partition)?;
 
     let canonical_root = ensure_safe_output_root(output_dir)?;
 
@@ -2853,6 +3318,7 @@ fn extract_dir_entries<T: ReadWriteSeek>(
                 destination.display()
             );
         }
+        record_sink_write(written);
         temporary.as_file().sync_all()?;
         if context.overwrite {
             temporary
@@ -2980,6 +3446,19 @@ fn to_py_runtime_error(error: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+#[cfg(all(feature = "python", feature = "benchmarking"))]
+#[pyfunction]
+fn _benchmark_metrics_reset() {
+    reset_benchmark_metrics();
+}
+
+#[cfg(all(feature = "python", feature = "benchmarking"))]
+#[pyfunction]
+fn _benchmark_metrics_json() -> PyResult<String> {
+    serde_json::to_string(&benchmark_metrics())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
 #[cfg(feature = "python")]
 #[pyfunction]
 fn inspect_json(path: &str) -> PyResult<String> {
@@ -3034,8 +3513,16 @@ fn inspect_gpt_json(path: &str, partition_index: Option<usize>, strict: bool) ->
 fn read_partition(py: Python<'_>, path: &str, index: usize) -> PyResult<Py<PyBytes>> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
     let partition = ensure_partition(&parsed.partitions, index)?;
-    let data = read_partition_bytes(Path::new(path), partition).map_err(to_py_runtime_error)?;
-    Ok(PyBytes::new(py, &data).unbind())
+    let output_size = partition_output_size(partition).map_err(to_py_runtime_error)?;
+    let output_len =
+        usize::try_from(output_size).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let data = PyBytes::new_with(py, output_len, |buffer| {
+        let mut writer = Cursor::new(buffer);
+        write_partition_to(Path::new(path), partition, &mut writer)
+            .map(|_| ())
+            .map_err(to_py_runtime_error)
+    })?;
+    Ok(data.unbind())
 }
 
 #[cfg(feature = "python")]
@@ -3043,16 +3530,15 @@ fn read_partition(py: Python<'_>, path: &str, index: usize) -> PyResult<Py<PyByt
 fn extract_partition(path: &str, index: usize, output_path: &str) -> PyResult<u64> {
     let parsed = parse_dmg(Path::new(path)).map_err(to_py_runtime_error)?;
     let partition = ensure_partition(&parsed.partitions, index)?;
-    let data = read_partition_bytes(Path::new(path), partition).map_err(to_py_runtime_error)?;
 
     let output = Path::new(output_path);
     let mut temporary = create_atomic_output(output).map_err(to_py_runtime_error)?;
-    temporary
-        .write_all(&data)
-        .map_err(|error| to_py_runtime_error(error.into()))?;
+    let written = write_partition_to(Path::new(path), partition, &mut temporary)
+        .map_err(to_py_runtime_error)?;
+    record_sink_write(written);
     persist_atomic_output(temporary, output).map_err(to_py_runtime_error)?;
 
-    u64::try_from(data.len()).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    Ok(written)
 }
 
 #[cfg(feature = "python")]
@@ -3201,6 +3687,11 @@ fn _pydmg(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_apple_file, module)?)?;
     module.add_function(wrap_pyfunction!(extract_apple_file, module)?)?;
     module.add_function(wrap_pyfunction!(create_dmg, module)?)?;
+    #[cfg(feature = "benchmarking")]
+    {
+        module.add_function(wrap_pyfunction!(_benchmark_metrics_reset, module)?)?;
+        module.add_function(wrap_pyfunction!(_benchmark_metrics_json, module)?)?;
+    }
     Ok(())
 }
 
@@ -3370,6 +3861,92 @@ mod tests {
         )
         .expect_err("oversized expansion must be rejected");
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn partition_reader_decodes_only_the_requested_chunk() {
+        let first = vec![b'a'; SECTOR_SIZE as usize];
+        let second = vec![b'b'; SECTOR_SIZE as usize];
+        let mut first_encoder = ZlibEncoder::new(Vec::new(), ZlibCompression::default());
+        first_encoder.write_all(&first).expect("encode first chunk");
+        let first_compressed = first_encoder.finish().expect("finish first chunk");
+        let mut second_encoder = ZlibEncoder::new(Vec::new(), ZlibCompression::default());
+        second_encoder
+            .write_all(&second)
+            .expect("encode second chunk");
+        let second_compressed = second_encoder.finish().expect("finish second chunk");
+
+        let mut image = NamedTempFile::new().expect("create image");
+        image
+            .write_all(&first_compressed)
+            .expect("write first chunk");
+        image
+            .write_all(&second_compressed)
+            .expect("write second chunk");
+        image.flush().expect("flush image");
+
+        let partition = PartitionRecord {
+            index: 0,
+            id: "0".to_string(),
+            name: "test".to_string(),
+            cfname: None,
+            attributes: None,
+            table: BlkxTable {
+                sector_count: 2,
+                chunks: vec![
+                    BlkxChunk::new(ChunkType::Zlib, 0, 1, 0, first_compressed.len() as u64),
+                    BlkxChunk::new(
+                        ChunkType::Zlib,
+                        1,
+                        1,
+                        first_compressed.len() as u64,
+                        second_compressed.len() as u64,
+                    ),
+                    BlkxChunk::term(2, (first_compressed.len() + second_compressed.len()) as u64),
+                ],
+                ..BlkxTable::default()
+            },
+        };
+
+        let mut reader = PartitionReader::open(image.path(), &partition).expect("open partition");
+        let mut prefix = [0_u8; 8];
+        reader.read_exact(&mut prefix).expect("read first span");
+        assert_eq!(prefix, [b'a'; 8]);
+        assert_eq!(reader.cached_span, Some(0));
+
+        reader
+            .seek(SeekFrom::Start(SECTOR_SIZE))
+            .expect("seek to second span");
+        reader.read_exact(&mut prefix).expect("read second span");
+        assert_eq!(prefix, [b'b'; 8]);
+        assert_eq!(reader.cached_span, Some(1));
+        assert!(reader.cache.capacity() < (SECTOR_SIZE * 2) as usize);
+    }
+
+    #[test]
+    fn partition_writer_rejects_short_declared_output() {
+        let mut image = NamedTempFile::new().expect("create image");
+        image.write_all(&[7]).expect("write raw byte");
+        image.flush().expect("flush image");
+        let partition = PartitionRecord {
+            index: 0,
+            id: "0".to_string(),
+            name: "short".to_string(),
+            cfname: None,
+            attributes: None,
+            table: BlkxTable {
+                sector_count: 1,
+                chunks: vec![
+                    BlkxChunk::new(ChunkType::Raw, 0, 1, 0, 1),
+                    BlkxChunk::term(1, 1),
+                ],
+                ..BlkxTable::default()
+            },
+        };
+
+        let error = write_partition_to(image.path(), &partition, &mut Vec::new())
+            .expect_err("short expanded output must be rejected");
+        assert!(error.to_string().contains("produced 1 bytes; expected 512"));
     }
 
     #[test]
