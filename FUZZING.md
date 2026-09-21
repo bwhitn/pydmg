@@ -169,6 +169,14 @@ or sanitizer report was produced:
 | `gpt` | 30 s | 28,858 | 686 / 1,335 | 531 MB | No finding |
 | `image` | 300 s | 2,789 | 5,663 / 12,485 | 1,164 MB | No finding |
 
+Hosted corrective PR fuzz run
+[`35617605544`](https://github.com/bwhitn/pydmg/actions/runs/35617605544) passed the `dmg_parse`,
+`blkx`, `chunk`, and `gpt` jobs; its whole-image job was skipped by the documented pull-request
+policy. Tag-gated release run
+[`35619257967`](https://github.com/bwhitn/pydmg/actions/runs/35619257967) repeated and passed all four
+required direct-parser release jobs. The longer local `image` campaign above supplies the
+whole-image evidence for the same corrective source.
+
 ## Known instrumentation limits
 
 - Native libraries built by dependency build scripts may not receive the same sanitizer coverage as
@@ -183,5 +191,5 @@ or sanitizer report was produced:
   lacked those tools. The latter completed 70,439 `gpt`, 17,096 `dmg_parse`, and 20 `image`
   executions without a crash, timeout, or sanitizer finding. The whole-image seeds are expensive,
   so that 35-second image run is only smoke evidence. As of 2026-09-21, rustup nightly,
-  `cargo-fuzz`, and `cargo-llvm-cov` are available locally. A fresh Rust 1.98.1 native run now
-  records 79.78% line coverage; the pinned hosted job's last recorded result remains 80.75%.
+  `cargo-fuzz`, and `cargo-llvm-cov` are available locally. The final local and hosted 0.1.3 Rust
+  1.98.1 runs both record 80.03% native line coverage.

@@ -42,10 +42,10 @@ structural parsing remain correctly documented as non-authenticating operations.
 
 The repository-owned lint, type, security-lint, test, documentation, range-validation,
 decompression, output-safety, CI, release, and fuzz-infrastructure findings have been remediated.
-The current local suite passes 22 Python integration/adversarial tests and 19 native Rust tests
-(18 cross-platform plus one Unix path-panic regression).
+The current local suite passes 22 Python integration/adversarial tests and 20 native Rust tests
+(19 cross-platform plus one Unix path-panic regression).
 Ruff, strict mypy, Bandit, rustfmt, and Clippy with warnings denied are green. Python line coverage
-remains 90% and now has a gate; fresh local and hosted Rust 1.98.1 runs both record 79.78% native
+remains 90% and now has a gate; final local and hosted Rust 1.98.1 runs both record 80.03% native
 lines against the separate 70% workflow gate.
 
 The 171 GB BLKX allocation is rejected before entering `apple-dmg`. The malformed APFS case is
@@ -66,9 +66,9 @@ deployments, but residual third-party resource behavior is deferred in this revi
 | Area | Current result |
 | --- | --- |
 | Python tests | 22 passed |
-| Native Rust tests | 19 passed on macOS; 18 cross-platform |
+| Native Rust tests | 20 passed on macOS; 19 cross-platform |
 | Python coverage | 90%; enforced at 90% in CI/release |
-| Native Rust coverage | Local and current hosted Rust 1.98.1 result 79.78% lines; 70% gate |
+| Native Rust coverage | Final local and hosted Rust 1.98.1 result 80.03% lines; 70% gate |
 | Python lint/type | Expanded Ruff rules, strict mypy, and consumer stub check pass |
 | Security lint | Bandit passes; three exact false positives have inline rationale |
 | Rust lint | rustfmt and Clippy `-D warnings` pass |
@@ -77,7 +77,7 @@ deployments, but residual third-party resource behavior is deferred in this revi
 | Rust dependency audit | PyO3 and quick-xml advisories resolved; no configured exceptions remain |
 | Documentation | README, API docstrings, security policy, audit, fuzz guide, and `AGENTS.md` updated |
 | Performance | Dated nine-sample before/after evidence; clean-SHA CI/release artifact gates |
-| Release readiness | Rust 1.98.1/maturin are pinned; MSRV remains tested at 1.88; resource risks are deferred and ADC is a compatibility limitation |
+| Release readiness | Version 0.1.3 is published from the verified tag; Rust 1.98.1/maturin are pinned and MSRV remains tested at 1.88 |
 
 ## Security findings
 
@@ -423,11 +423,12 @@ closed before output and is not itself a security vulnerability.
 
 - Status: **Resolved locally**
 
-There are now 19 native tests on the reviewed Unix host (18 cross-platform) and 22 Python tests
+There are now 20 native tests on the reviewed Unix host (19 cross-platform) and 22 Python tests
 covering BLKX count/truncation/layout, range overflow, zlib/bzip2/LZFSE decoding, expansion limits,
 streamed/binary plist preflight, dependency panic containment, FAT read budgets, hostile HFS/APFS
-block sizes, GPT assertion/count/range/CRC preflight, filesystem-partition budgets, checksum ranges,
-symlinks, atomic output, and real FAT/HFS+/APFS fixtures. Sensitive crash bytes are not committed.
+block sizes, GPT assertion/count/range/CRC preflight, filesystem-partition budgets, streamed large
+Zero/Ignore spans, checksum ranges, symlinks, atomic output, and real FAT/HFS+/APFS fixtures.
+Sensitive crash bytes are not committed.
 
 ### QA-007 — Coverage was manual and unenforced
 
@@ -438,10 +439,11 @@ Rust reports and enforce 90% Python / 70% native line floors; CI uploads both. T
 was 66/73 statements plus branch accounting (90%). Hosted run
 [`29674156138`](https://github.com/bwhitn/pydmg/actions/runs/29674156138) at commit `1de7a87`
 confirmed 90% Python coverage and 80.75% native lines, 60.22% functions, and 79.03% regions.
-A fresh local run with the pinned Rust 1.98.1 compiler reports 79.78% native lines, 59.19%
+A clean 0.1.2 run with the pinned Rust 1.98.1 compiler reported 79.78% native lines, 59.19%
 functions, and 77.82% regions. The optimized candidate's hosted run
 [`35608047824`](https://github.com/bwhitn/pydmg/actions/runs/35608047824) reproduced exactly those
-native totals and 90% Python coverage; all recorded native results remain above the 70% gate.
+native totals and 90% Python coverage. The corrective 0.1.3 local and hosted release runs report
+80.03% native lines and 90% Python coverage; all recorded native results remain above the gates.
 
 ### QA-008 — Fuzzing was not continuous
 
@@ -700,8 +702,8 @@ memory availability are retained for completeness but deferred under the current
    nightly, `cargo-fuzz`, or `cargo-llvm-cov`, so a temporary toolchain under `/private/tmp` supplied
    follow-up ASan evidence and hosted CI supplied the 80.75% native line result. As of the 2026-09-21
    review, rustup-managed Rust 1.98.1/1.88.0/nightly plus `cargo-fuzz` and `cargo-llvm-cov` are
-   available locally. Local and current hosted Rust 1.98.1 native coverage are both 79.78%; the
-   optimized committed candidate has also passed the complete hosted cross-platform PR gate.
+   available locally. Final local and hosted Rust 1.98.1 native coverage are both 80.03%; the
+   optimized and corrective commits passed their complete hosted cross-platform PR gates.
 9. No upstream issue, pull request, or external message was created as part of this repository-only
    work. Upstream coordination is therefore still outstanding.
 
@@ -729,19 +731,19 @@ mypy
 bandit -q -r python scripts
 pytest -q                                      # 22 passed
 coverage run -m pytest -q && coverage report  # 90%
-cargo llvm-cov report --fail-under-lines 70   # 79.78% lines on Rust 1.98.1
+cargo llvm-cov report --fail-under-lines 70   # 80.03% lines on Rust 1.98.1
 cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
-cargo test --locked --all-targets --all-features  # 19 passed on macOS
+cargo test --locked --all-targets --all-features  # 20 passed on macOS
 cargo check --manifest-path fuzz/Cargo.toml --bins
-rustup run 1.88.0 cargo test --locked --all-targets --all-features  # 19 passed
+rustup run 1.88.0 cargo test --locked --all-targets --all-features  # 20 passed
 python scripts/check_audit_exceptions.py           # 0 exceptions
 python scripts/check_licenses.py
 python scripts/build_pydoc.py --cleanup
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
-python scripts/verify_versions.py --expected 0.1.2
+python scripts/verify_versions.py --expected 0.1.3
 cargo audit                                    # 107 dependencies; no findings
 python -m pip_audit .                         # no known vulnerabilities
 python -m pip_audit                           # no known vulnerabilities
@@ -796,8 +798,40 @@ authorized acceptance image, reporting two and seven partitions respectively.
 The local static-liblzma artifacts passed auditwheel and Twine. The macOS ABI3 wheel is 825,684
 bytes with SHA-256 `f23103bc5eabba23bb0319d2ac9a80f2bd5a20ce0ae976276328cad8b5f68422`; the
 3,120,635-byte source distribution has SHA-256
-`c82125c75c862ab94a7c1a6daadd897ce118b9857028195d94cd122ff9d766d3`. Hosted and published
-artifact evidence is recorded after the tag-gated workflow completes.
+`c82125c75c862ab94a7c1a6daadd897ce118b9857028195d94cd122ff9d766d3`.
+
+Corrective PR [`#4`](https://github.com/bwhitn/pydmg/pull/4) passed complete hosted CI run
+[`35617605668`](https://github.com/bwhitn/pydmg/actions/runs/35617605668), including Python 3.9–3.13
+Linux/macOS/Windows, Rust 1.88 MSRV, 90% Python coverage, 80.03% native line coverage, audits,
+documentation, and clean-SHA performance. Paired fuzz run
+[`35617605544`](https://github.com/bwhitn/pydmg/actions/runs/35617605544) passed all four direct-parser
+jobs. PR #4 merged as `36c6635369652f43a6f88211e905873e51bc1148`; manual release preflight
+[`35618182500`](https://github.com/bwhitn/pydmg/actions/runs/35618182500) passed before that exact
+revision was tagged `v0.1.3`.
+
+Trusted release run [`35619257967`](https://github.com/bwhitn/pydmg/actions/runs/35619257967)
+passed every quality, security, performance, direct-parser fuzz, sdist, five-wheel, metadata, and
+PyPI publishing job. The non-yanked public artifacts are:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| macOS x86-64 ABI3 wheel | 821,843 | `cf180be7ab1e91e4a4df56e1a7b2e958599a3886376902d83dd3284c7ee2c6e8` |
+| macOS arm64 ABI3 wheel | 830,643 | `4828d8e8100dfb563050eb76000159b62bd791ea685baf419278c4e75641e848` |
+| manylinux aarch64 ABI3 wheel | 935,557 | `b1f1977fa7c4751a20bbe7c9a2484658c4cf4208c7053f5706dd9bd992190c92` |
+| manylinux x86-64 ABI3 wheel | 930,413 | `27055d1875c6ead8500fa0fc62856cf23698615db745359bf909e4212ed73485` |
+| Windows x86-64 ABI3 wheel | 722,846 | `ac600e8a84ab988e1cfad8aacfc80044ba0e9b664f4ff28775e368f9e0568c6a` |
+| Source distribution | 3,121,652 | `a7cdca2ec85e0bfb70a5dc8e84cdc2e1e264b27ac0a91c53b98503e783d438b0` |
+
+A fresh isolated wheel-only install from public PyPI parsed the committed FAT fixture and the
+authorized Apple image, reporting two and seven partitions. ALES exact-pins `pydmg==0.1.3`, locks
+the six hashes above, and retains the license, third-party notices, and CycloneDX SBOM through its
+stripped/pruned runtime. Its host and contained test-image suites each pass all 1,959 tests. The
+exact operational image `sha256:436d94394841b39bf5107c7a638d59af909c9c9ddb66cc280df93da127f67c35`
+preserves the authorized image's 21-record type profile with no error, exact pydmg DMG report,
+ObjectRules map, and stored-artifact paths and bytes; wall time improved from 36.72 to 30.92
+seconds versus the 0.1.1 baseline. The generated FAT acceptance preserves its expected eight
+records, ObjectRules map, and stored-artifact bytes while updating parser diagnostic wording; wall
+time improved from 8.83 to 3.59 seconds. No authorized corpus bytes, names, or hashes are recorded.
 
 ## Deferred and non-blocking follow-up
 
